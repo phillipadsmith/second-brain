@@ -1277,10 +1277,17 @@ export default {
 
     // /mcp
     if (url.pathname === "/mcp") {
-      // Create a new server instance per request (required for security)
+      if (!isAuthorized(request, env)) {
+        const msg = "second-brain: Unauthorized — check Authorization: Bearer <token> in your MCP client config";
+        if (request.headers.get("Accept")?.includes("text/event-stream")) {
+          const event = JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: msg }, id: null });
+          return new Response(`data: ${event}\n\n`, {
+            headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...CORS_HEADERS },
+          });
+        }
+        return json({ error: msg }, 401);
+      }
       const server = buildMcpServer(env, ctx);
-
-      // Use Cloudflare's recommended handler
       return createMcpHandler(server)(request, env, ctx);
     }
 
