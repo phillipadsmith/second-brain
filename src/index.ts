@@ -1136,7 +1136,10 @@ const defaultHandler = {
     if (url.pathname === "/oauth/authorize") {
       let oauthReq: any;
       try {
-        oauthReq = await (env as any).OAUTH_PROVIDER.parseAuthRequest(request);
+        // workers-oauth-provider behaves differently with POST requests; pass a
+        // URL-only GET clone so parseAuthRequest reads query params cleanly.
+        const parseReq = request.method === "POST" ? new Request(request.url, { method: "GET" }) : request;
+        oauthReq = await (env as any).OAUTH_PROVIDER.parseAuthRequest(parseReq);
       } catch {
         return new Response("Invalid authorization request — this page must be opened by an MCP client.", {
           status: 400, headers: { "Content-Type": "text/plain" },
