@@ -5,6 +5,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpHandler } from "agents/mcp";
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
 
 export interface Env {
@@ -12,6 +13,8 @@ export interface Env {
   VECTORIZE: VectorizeIndex;
   AI: Ai;
   AUTH_TOKEN: string;
+  OAUTH_KV: KVNamespace;
+  OAUTH_PASSWORD: string;
 }
 
 const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
@@ -82,6 +85,17 @@ function json(data: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json", ...CORS_HEADERS },
   });
+}
+
+function loginHtml(error?: string): string {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>second-brain</title></head><body style="font-family:sans-serif;max-width:360px;margin:80px auto;padding:0 16px">
+    <h2>second-brain</h2>
+    ${error ? `<p style="color:red">${error}</p>` : ""}
+    <form method="POST">
+      <input type="password" name="password" placeholder="Password" autofocus style="width:100%;padding:8px;margin-bottom:8px;box-sizing:border-box">
+      <button type="submit" style="width:100%;padding:8px">Authorize</button>
+    </form>
+  </body></html>`;
 }
 
 async function embed(text: string, env: Env): Promise<number[]> {
@@ -1098,9 +1112,54 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
 
-export default {
+// ─── OAuth API handler — /mcp only ────────────────────────────────────────────
+// OAuthProvider validates the token before calling this. ctx.props is set for
+// OAuth tokens; resolveExternalToken handles the static AUTH_TOKEN case.
+
+const apiHandler = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (!dbReady) {
+      ctx.waitUntil(initializeDatabase(env).then(() => { dbReady = true; }));
+    }
+    const server = buildMcpServer(env, ctx);
+    return createMcpHandler(server)(request, env, ctx);
+  },
+};
+
+// ─── Default handler — all non-MCP routes ────────────────────────────────────
+
+const defaultHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    // OAuth authorize endpoint
+    if (url.pathname === "/oauth/authorize") {
+      let oauthReq: any;
+      try {
+        oauthReq = await (env as any).OAUTH_PROVIDER.parseAuthRequest(request);
+      } catch {
+        return new Response("Invalid authorization request — this page must be opened by an MCP client.", {
+          status: 400, headers: { "Content-Type": "text/plain" },
+        });
+      }
+      if (request.method === "POST") {
+        const form = await request.formData();
+        if (form.get("password") !== env.OAUTH_PASSWORD) {
+          return new Response(loginHtml("Invalid password"), {
+            status: 401,
+            headers: { "Content-Type": "text/html" },
+          });
+        }
+        const { redirectTo } = await (env as any).OAUTH_PROVIDER.completeAuthorization({
+          request: oauthReq,
+          userId: "owner",
+          scope: oauthReq.scope,
+          props: { userId: "owner" },
+        });
+        return Response.redirect(redirectTo, 302);
+      }
+      return new Response(loginHtml(), { headers: { "Content-Type": "text/html" } });
+    }
 
     if (!dbReady) {
       ctx.waitUntil(
@@ -1275,22 +1334,6 @@ export default {
       return json(results);
     }
 
-    // /mcp
-    if (url.pathname === "/mcp") {
-      if (!isAuthorized(request, env)) {
-        const msg = "second-brain: Unauthorized — check Authorization: Bearer <token> in your MCP client config";
-        if (request.headers.get("Accept")?.includes("text/event-stream")) {
-          const event = JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: msg }, id: null });
-          return new Response(`data: ${event}\n\n`, {
-            headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...CORS_HEADERS },
-          });
-        }
-        return json({ error: msg }, 401);
-      }
-      const server = buildMcpServer(env, ctx);
-      return createMcpHandler(server)(request, env, ctx);
-    }
-
     // POST /chat
     if (url.pathname === "/chat" && request.method === "POST") {
       if (!isAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
@@ -1320,3 +1363,21 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
+
+// ─── Export ───────────────────────────────────────────────────────────────────
+
+export default new OAuthProvider({
+  apiRoute: "/mcp",
+  apiHandler,
+  defaultHandler,
+  authorizeEndpoint: "/oauth/authorize",
+  tokenEndpoint: "/oauth/token",
+  clientRegistrationEndpoint: "/oauth/register",
+  // Accept the static AUTH_TOKEN for Claude Desktop + mcp-remote (no browser flow needed)
+  resolveExternalToken: async ({ token, env }) => {
+    if (token === (env as Env).AUTH_TOKEN) {
+      return { props: { userId: "owner" } };
+    }
+    return null;
+  },
+});

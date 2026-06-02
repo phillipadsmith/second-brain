@@ -22,5 +22,9 @@ metric = "cosine"
 [ai]
 binding = "AI"
 
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "1b92783aa6544c2b9dda13f59b7e1977"
+
 [assets]
 directory = "./public"
