@@ -2381,7 +2381,7 @@
     async function apiMcp(toolName, args) {
       const res = await fetch(`${WORKER_URL}/mcp`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', 'Authorization': `Bearer ${AUTH_TOKEN}` },
         body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call', params: { name: toolName, arguments: args } })
       });
       const text = await res.text();
