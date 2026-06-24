@@ -9,7 +9,8 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "second-brain-db"
+			"database_name": "second-brain-db",
+			"database_id": "4f475851-3a09-4cb4-b6b6-b4b867fdf899"
 		}
 	],
 	// The VECTORIZE binding is intentionally NOT declared here. When a vectorize
@@ -25,7 +26,8 @@
 	},
 	"kv_namespaces": [
 		{
-			"binding": "OAUTH_KV"
+			"binding": "OAUTH_KV",
+			"id": "1b92783aa6544c2b9dda13f59b7e1977"
 		}
 	],
 	"vars": {
