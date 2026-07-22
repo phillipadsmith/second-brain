@@ -7,17 +7,29 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpHandler } from "agents/mcp";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
+import {
+  INTEGRATION_PROVIDERS,
+  getProvider,
+  loadIntegration,
+  saveIntegration,
+  deleteIntegration,
+  integrationStatus,
+} from "./integrations";
+import type { IntegrationRecord, MirrorStore } from "./integrations";
 
-export interface Env {
-  DB: D1Database;
-  VECTORIZE: VectorizeIndex;
-  AI: Ai;
-  AUTH_TOKEN: string;
-  OAUTH_KV: KVNamespace;
+// Bindings come from the generated Cloudflare.Env (see `wrangler types`);
+// VECTORIZE_GRACE_MS is widened from its generated literal default so tests
+// and per-deploy vars can override it.
+export interface Env extends Omit<Cloudflare.Env, "VECTORIZE_GRACE_MS"> {
   VECTORIZE_GRACE_MS?: string;
 }
 
 const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
+
+// Worker version, echoed by GET /health. The desktop app compares this against
+// the version it bundles to offer a one-click "update your Second Brain".
+// Bump (semver) when the Worker changes; see installer/README "Worker versioning".
+export const SB_VERSION = "2.0.5";
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
@@ -80,6 +92,9 @@ const DIGEST_MAX_TOKENS = 400;
 
 // ─── Vectorize constants ──────────────────────────────────────────────────────
 
+const VECTORIZE_FIX_HINT =
+  "run `npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine`, or grant the build token Vectorize Edit and redeploy";
+
 const VECTORIZE_TOP_K_MULTIPLIER = 3;
 // getByIds batch size for tag-scoped recall — Vectorize rejects more than 20 IDs
 // per call (VECTOR_GET_ERROR, code 40007)
@@ -91,6 +106,8 @@ const D1_MAX_BOUND_PARAMS = 100;
 const RRF_K = 60;                    // Reciprocal Rank Fusion dampening constant
 const KEYWORD_CANDIDATE_LIMIT = 100; // max rows the LIKE keyword query scans
 const KEYWORD_MIN_TOKEN_LEN = 2;     // ignore 1-char tokens
+const QUERY_SATURATION_FRACTION = 0.3; // a query term in >30% of memories is non-discriminative for THIS brain → dropped before embedding
+const MAX_QUERY_TERMS = 3;             // embed at most the rarest N content terms so common words can't dilute the query
 const KEYWORD_STOPWORDS = new Set([
   "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are", "was", "were", "be", "been",
   "i", "me", "my", "we", "you", "it", "this", "that", "these", "those", "with", "about", "from", "at", "as", "by",
@@ -135,6 +152,394 @@ export function getKind(tags: string[]): MemoryKind | null {
 export function withKind(tags: string[], kind: MemoryKind): string[] {
   const cleaned = tags.filter(t => !t.startsWith(KIND_PREFIX));
   return [...cleaned, `${KIND_PREFIX}${kind}`];
+}
+
+// ─── Relationship graph (issue #16) ─────────────────────────────────────────────
+// Edges live in a dedicated `edges` table — the one additive schema change. Edge
+// types and provenance are validated in CODE against this registry rather than via
+// SQL CHECK constraints, so adding a new type is a one-line change here that ships
+// with a deploy and never requires a migration. Per-edge extension data goes in the
+// edges.metadata JSON column (the edges analogue of entries.tags) — also no ALTER.
+
+export const EDGE_TYPES = {
+  relates_to:      { directed: false, label: "Related to",      allowedKinds: null },
+  supersedes:      { directed: true,  label: "Supersedes",      allowedKinds: null },
+  caused_by:       { directed: true,  label: "Caused by",       allowedKinds: null },
+  decided:         { directed: true,  label: "Decided",         allowedKinds: ["episodic"] },
+  about_person:    { directed: true,  label: "About person",    allowedKinds: null },
+  part_of_project: { directed: true,  label: "Part of project", allowedKinds: null },
+  follows:         { directed: true,  label: "Follows",         allowedKinds: ["episodic"] },
+} as const satisfies Record<string, { directed: boolean; label: string; allowedKinds: readonly MemoryKind[] | null }>;
+
+export type EdgeType = keyof typeof EDGE_TYPES;
+
+export const PROVENANCE_VALUES = ["explicit", "inferred", "system"] as const;
+export type EdgeProvenance = (typeof PROVENANCE_VALUES)[number];
+
+const DEFAULT_EDGE_WEIGHT = 0.5;
+
+export function isValidEdgeType(type: string): type is EdgeType {
+  return Object.prototype.hasOwnProperty.call(EDGE_TYPES, type);
+}
+
+// Symmetric (undirected) edges store the pair smaller-id-first so A→B and B→A
+// collapse to one row; directed edges keep their natural order.
+export function isSymmetric(type: EdgeType): boolean {
+  return !EDGE_TYPES[type].directed;
+}
+
+export function edgeLabel(type: EdgeType): string {
+  return EDGE_TYPES[type].label;
+}
+
+export function allowedKindsFor(type: EdgeType): readonly MemoryKind[] | null {
+  return EDGE_TYPES[type].allowedKinds;
+}
+
+// The single writer for edges. Rejects self-links and unknown types (returns null),
+// normalizes symmetric pairs, and upserts idempotently so re-linking the same pair
+// keeps the stronger weight instead of erroring or duplicating.
+export async function createEdge(
+  sourceId: string,
+  targetId: string,
+  type: string,
+  opts: { weight?: number; provenance?: EdgeProvenance; metadata?: Record<string, unknown> },
+  env: Env,
+): Promise<{ source_id: string; target_id: string; type: EdgeType } | null> {
+  if (!isValidEdgeType(type)) return null;
+  if (sourceId === targetId) return null;
+
+  let source = sourceId;
+  let target = targetId;
+  if (isSymmetric(type) && source > target) [source, target] = [target, source];
+
+  const weight = Math.max(0, Math.min(1, opts.weight ?? DEFAULT_EDGE_WEIGHT));
+  const provenance = opts.provenance ?? "inferred";
+  const metadata = JSON.stringify(opts.metadata ?? {});
+  const now = Date.now();
+
+  await env.DB.prepare(
+    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(source_id, target_id, type) DO UPDATE SET weight = max(weight, excluded.weight), updated_at = excluded.updated_at`
+  ).bind(crypto.randomUUID(), source, target, type, weight, provenance, metadata, now, now).run();
+
+  return { source_id: source, target_id: target, type };
+}
+
+// The single remover for edges. The WHERE is order-agnostic — it matches directed
+// edges stated in either direction AND symmetric pairs regardless of the smaller-id-
+// first normalization createEdge applied — so callers never re-derive that rule.
+// Optional type narrows the delete to one relationship type; omitted removes every
+// edge between the pair. Returns rows removed: 0 is not an error (idempotent delete,
+// the mirror of createEdge's idempotent upsert).
+export async function deleteEdge(
+  sourceId: string,
+  targetId: string,
+  type: string | undefined,
+  env: Env,
+): Promise<number> {
+  let sql = `DELETE FROM edges WHERE ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))`;
+  const bindings: string[] = [sourceId, targetId, targetId, sourceId];
+  if (type) {
+    sql += ` AND type = ?`;
+    bindings.push(type);
+  }
+  const result = await env.DB.prepare(sql).bind(...bindings).run();
+  return result.meta.changes ?? 0;
+}
+
+// ─── Graph traversal ────────────────────────────────────────────────────────────
+
+const GRAPH_MAX_HOPS = 3;
+const GRAPH_FANOUT_CAP = 8;   // max edges followed per node per hop (strongest first)
+const GRAPH_MAX_NODES = 50;   // cap on total expanded nodes — bounds hub-node blowup
+const GRAPH_HOP_DECAY = 0.6;  // score multiplier per hop of graph distance (multi-hop recall)
+// Each id binds twice per BFS query (source_id IN … OR target_id IN …), so batch
+// well under the 100-bound-param limit.
+const EDGE_QUERY_BATCH = Math.floor(D1_MAX_BOUND_PARAMS / 2);
+
+export interface GraphNeighbor {
+  id: string;
+  hop: number;
+  viaWeight: number;
+  viaType: EdgeType;
+}
+
+// Returns the subset of `ids` whose entry is tagged status:deprecated.
+async function deprecatedIdsAmong(ids: string[], env: Env): Promise<Set<string>> {
+  const deprecated = new Set<string>();
+  for (let i = 0; i < ids.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = ids.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const ph = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT id, tags FROM entries WHERE id IN (${ph})`
+    ).bind(...batch).all() as { results: Record<string, any>[] };
+    for (const r of results) {
+      if (getStatus(JSON.parse(r.tags ?? "[]")) === "deprecated") deprecated.add(r.id as string);
+    }
+  }
+  return deprecated;
+}
+
+// Breadth-first traversal of the edges table outward from a set of seed nodes.
+// Shared by recall (multi-hop expansion), GET /connections, and GET /graph. Bounded
+// by hop/fanout/node caps so a heavily-connected node can't explode the query, and
+// skips status:deprecated nodes by default so stale entries aren't traversed through.
+export async function expandGraph(
+  seedIds: string[],
+  opts: { hops: number; fanoutCap?: number; maxNodes?: number; includeDeprecated?: boolean },
+  env: Env,
+): Promise<GraphNeighbor[]> {
+  const hops = Math.max(0, Math.min(GRAPH_MAX_HOPS, opts.hops));
+  if (hops === 0 || seedIds.length === 0) return [];
+  const fanoutCap = opts.fanoutCap ?? GRAPH_FANOUT_CAP;
+  const maxNodes = opts.maxNodes ?? GRAPH_MAX_NODES;
+
+  const visited = new Set(seedIds);
+  const out: GraphNeighbor[] = [];
+  let frontier = [...seedIds];
+
+  for (let hop = 1; hop <= hops && frontier.length && out.length < maxNodes; hop++) {
+    // Pull every edge touching the current frontier, strongest first (batched).
+    const edgeRows: { source_id: string; target_id: string; type: string; weight: number }[] = [];
+    for (let i = 0; i < frontier.length; i += EDGE_QUERY_BATCH) {
+      const batch = frontier.slice(i, i + EDGE_QUERY_BATCH);
+      const ph = batch.map(() => "?").join(", ");
+      const { results } = await env.DB.prepare(
+        `SELECT source_id, target_id, type, weight FROM edges WHERE source_id IN (${ph}) OR target_id IN (${ph}) ORDER BY weight DESC`
+      ).bind(...batch, ...batch).all() as { results: any[] };
+      edgeRows.push(...results);
+    }
+
+    // For each frontier node, take its strongest unseen neighbors up to the fanout cap.
+    const frontierSet = new Set(frontier);
+    const perNodeCount = new Map<string, number>();
+    const candidates: GraphNeighbor[] = [];
+    for (const e of edgeRows) {
+      let from: string | null = null;
+      let to: string | null = null;
+      if (frontierSet.has(e.source_id)) { from = e.source_id; to = e.target_id; }
+      else if (frontierSet.has(e.target_id)) { from = e.target_id; to = e.source_id; }
+      if (!from || !to || visited.has(to)) continue;
+      const n = perNodeCount.get(from) ?? 0;
+      if (n >= fanoutCap) continue;
+      perNodeCount.set(from, n + 1);
+      candidates.push({ id: to, hop, viaWeight: e.weight, viaType: e.type as EdgeType });
+    }
+
+    // Drop deprecated nodes before they enter results or the next frontier.
+    let allowed = candidates;
+    if (!opts.includeDeprecated && candidates.length) {
+      const deprecated = await deprecatedIdsAmong([...new Set(candidates.map(c => c.id))], env);
+      allowed = candidates.filter(c => !deprecated.has(c.id));
+    }
+
+    const nextFrontier: string[] = [];
+    for (const c of allowed) {
+      if (visited.has(c.id)) continue; // first (strongest) wins; dedupe across this hop
+      if (out.length >= maxNodes) break;
+      visited.add(c.id);
+      out.push(c);
+      nextFrontier.push(c.id);
+    }
+    frontier = nextFrontier;
+  }
+
+  return out;
+}
+
+// Hydrate graph node ids into full entry rows (id → row), batched within the D1
+// bound-param limit. Shared by /connections and /graph.
+async function hydrateGraphEntries(ids: string[], env: Env): Promise<Map<string, Record<string, any>>> {
+  const map = new Map<string, Record<string, any>>();
+  for (let i = 0; i < ids.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = ids.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const ph = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${ph})`
+    ).bind(...batch).all() as { results: Record<string, any>[] };
+    for (const r of results) map.set(r.id as string, r);
+  }
+  return map;
+}
+
+export interface Connection {
+  id: string;
+  content: string;
+  tags: string[];
+  source: string;
+  created_at: number;
+  type: EdgeType;
+  label: string;
+  weight: number;
+}
+
+// 1-hop neighborhood of an entry, hydrated and annotated with edge type/weight.
+// Backs both the `connections` MCP tool and GET /connections.
+export async function getConnections(id: string, type: string | undefined, env: Env): Promise<Connection[]> {
+  let neighbors = await expandGraph([id], { hops: 1 }, env);
+  if (type) neighbors = neighbors.filter(n => n.viaType === type);
+  if (!neighbors.length) return [];
+
+  const rows = await hydrateGraphEntries(neighbors.map(n => n.id), env);
+  const out: Connection[] = [];
+  for (const n of neighbors) {
+    const row = rows.get(n.id);
+    if (!row) continue; // neighbor was deleted (cascade should prevent this) — skip dangling
+    out.push({
+      id: n.id,
+      content: row.content as string,
+      tags: JSON.parse(row.tags ?? "[]"),
+      source: row.source as string,
+      created_at: row.created_at as number,
+      type: n.viaType,
+      label: edgeLabel(n.viaType),
+      weight: n.viaWeight,
+    });
+  }
+  return out;
+}
+
+export interface GraphNode {
+  id: string;
+  label: string;
+  tags: string[];
+  kind: MemoryKind | null;
+  status: MemoryStatus | null;
+  importance: number;
+  created_at: number;
+}
+
+export interface GraphView {
+  nodes: GraphNode[];
+  edges: { source: string; target: string; type: string; weight: number }[];
+}
+
+// Assemble a node+edge subgraph for the dashboard graph view. Either the 2-hop
+// neighborhood of a seed entry, or (default) the most strongly-connected slice of the
+// whole graph — uncapped unless the caller passes an explicit limit. Only edges whose
+// BOTH endpoints are in the returned node set are included, so the client never has
+// to handle dangling edges.
+export async function buildGraph(opts: { seed?: string; limit?: number }, env: Env): Promise<GraphView> {
+  const limit = opts.limit && opts.limit > 0 ? opts.limit : Infinity;
+
+  // 1. Determine the candidate node id set.
+  let nodeIds: string[];
+  if (opts.seed) {
+    const neighbors = await expandGraph([opts.seed], { hops: 2, maxNodes: limit, includeDeprecated: true }, env);
+    nodeIds = [opts.seed, ...neighbors.map(n => n.id)].slice(0, limit);
+  } else {
+    const sql = Number.isFinite(limit)
+      ? `SELECT source_id, target_id FROM edges ORDER BY weight DESC LIMIT ${limit * 4}`
+      : `SELECT source_id, target_id FROM edges ORDER BY weight DESC`;
+    const { results } = await env.DB.prepare(sql)
+      .all() as { results: { source_id: string; target_id: string }[] };
+    const ids: string[] = [];
+    const seenIds = new Set<string>();
+    for (const r of results) {
+      for (const id of [r.source_id, r.target_id]) {
+        if (ids.length >= limit) break;
+        if (!seenIds.has(id)) { seenIds.add(id); ids.push(id); }
+      }
+      if (ids.length >= limit) break;
+    }
+    nodeIds = ids;
+  }
+  if (!nodeIds.length) return { nodes: [], edges: [] };
+
+  // 2. Hydrate nodes (drop ids with no entry row — that's how dangling edges get pruned).
+  const nodeRows = new Map<string, Record<string, any>>();
+  for (let i = 0; i < nodeIds.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = nodeIds.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const ph = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT id, content, tags, importance_score, created_at FROM entries WHERE id IN (${ph})`
+    ).bind(...batch).all() as { results: Record<string, any>[] };
+    for (const r of results) nodeRows.set(r.id as string, r);
+  }
+
+  const nodes: GraphNode[] = [];
+  for (const id of nodeIds) {
+    const r = nodeRows.get(id);
+    if (!r) continue;
+    const tags: string[] = JSON.parse(r.tags ?? "[]");
+    nodes.push({
+      id,
+      label: (r.content as string).slice(0, 80),
+      tags,
+      kind: getKind(tags),
+      status: getStatus(tags),
+      importance: (r.importance_score as number) ?? 0,
+      created_at: r.created_at as number,
+    });
+  }
+  const nodeIdSet = new Set(nodes.map(n => n.id));
+  if (!nodeIdSet.size) return { nodes: [], edges: [] };
+
+  // 3. Edges with BOTH endpoints present. Fetch edges touching the node set (chunked,
+  // 2 binds/id), then keep only the internal ones — never a dangling edge.
+  const presentIds = [...nodeIdSet];
+  const edgeSeen = new Set<string>();
+  const edges: GraphView["edges"] = [];
+  for (let i = 0; i < presentIds.length; i += EDGE_QUERY_BATCH) {
+    const batch = presentIds.slice(i, i + EDGE_QUERY_BATCH);
+    const ph = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT source_id, target_id, type, weight FROM edges WHERE source_id IN (${ph}) OR target_id IN (${ph}) ORDER BY weight DESC`
+    ).bind(...batch, ...batch).all() as { results: any[] };
+    for (const e of results) {
+      if (!nodeIdSet.has(e.source_id) || !nodeIdSet.has(e.target_id)) continue;
+      const key = `${e.source_id}|${e.target_id}|${e.type}`;
+      if (edgeSeen.has(key)) continue;
+      edgeSeen.add(key);
+      edges.push({ source: e.source_id, target: e.target_id, type: e.type, weight: e.weight });
+    }
+  }
+
+  return { nodes, edges };
+}
+
+// Auto-link a freshly-stored entry to its most-similar existing neighbors with
+// inferred `relates_to` edges. Reuses the similarity scores already computed during
+// duplicate/contradiction detection — no extra embed or Vectorize query. Only the
+// strongest few links above a confidence floor are kept so the graph stays sparse;
+// the nightly graph pass later refines and types these.
+//
+// Threshold tuned for the bge-small-en-v1.5 embedding model, whose cosine scores are
+// NOT spread across [0,1]: unrelated text lands ~0.4–0.6, mere keyword/concept overlap
+// ~0.6–0.7, genuinely same-topic ~0.78–0.85, near-duplicate ≥0.85. We sit just below
+// the 0.85 smart-merge band so we capture "clearly related but distinct" while
+// rejecting loose overlap (e.g. "espresso filter" vs "Buy Me a Coffee", ~0.65). Lower
+// toward ~0.74 if the graph feels too sparse; raise toward ~0.82 if noise returns.
+const EDGE_INFER_THRESHOLD = 0.78; // min cosine similarity to auto-link (was 0.55 — too loose, linked keyword-overlap noise)
+const EDGE_INFER_MAX = 3;          // max inferred links per new entry
+
+export async function inferEdgesOnWrite(
+  newId: string,
+  neighbors: { id: string; score: number }[],
+  env: Env,
+): Promise<void> {
+  const top = neighbors
+    .filter(n => n.id !== newId && n.score >= EDGE_INFER_THRESHOLD)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, EDGE_INFER_MAX);
+  for (const n of top) {
+    await createEdge(newId, n.id, "relates_to", { weight: n.score, provenance: "inferred" }, env);
+  }
+}
+
+// Compute auto-link neighbors from a query embedding: the topK Vectorize matches
+// collapsed to parent ids (strongest score per parent). Lets the append path reuse the
+// same inference as on capture without re-deriving the dedupe logic.
+async function neighborsFromVectorQuery(values: number[], env: Env): Promise<{ id: string; score: number }[]> {
+  const { matches } = await env.VECTORIZE.query(values, { topK: 5, returnMetadata: "all" });
+  const scores = new Map<string, number>();
+  for (const m of matches) {
+    const pid = (m.metadata as any)?.parentId ?? m.id;
+    scores.set(pid, Math.max(scores.get(pid) ?? 0, m.score));
+  }
+  return [...scores.entries()].map(([id, score]) => ({ id, score }));
 }
 
 // ─── Runtime state ────────────────────────────────────────────────────────────
@@ -241,6 +646,40 @@ async function embed(text: string, env: Env): Promise<number[]> {
   return result.data[0] as number[];
 }
 
+// ─── Vectorize index health ───────────────────────────────────────────────────
+// Vectorize is the one resource Cloudflare cannot auto-provision at deploy time,
+// and the default one-click build token lacks permission to create it. When the
+// index is missing the Worker still runs (capture stays resilient), but semantic
+// recall is degraded. We detect that at runtime via the binding's describe()
+// (a capability-based call that works regardless of API token scopes) so the
+// dashboard and recall can report it. See docs/superpowers/specs/2026-06-26-*.
+
+export const VECTORIZE_INDEX_NAME = "second-brain-vectors";
+
+export interface VectorizeHealth {
+  ok: boolean;
+  indexName: string;
+  dimensions?: number;
+  error?: string;
+}
+
+export async function checkVectorizeHealth(env: Env): Promise<VectorizeHealth> {
+  try {
+    const info = (await env.VECTORIZE.describe()) as any;
+    return {
+      ok: true,
+      indexName: VECTORIZE_INDEX_NAME,
+      dimensions: info?.dimensions ?? info?.config?.dimensions,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      indexName: VECTORIZE_INDEX_NAME,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
 // ─── Database initialization ──────────────────────────────────────────────────
 
 async function initializeDatabase(env: Env): Promise<void> {
@@ -248,6 +687,13 @@ async function initializeDatabase(env: Env): Promise<void> {
     await env.DB.exec(`CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]')`);
     await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC)`);
     await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source)`);
+    // Relationship graph (issue #16). One additive table — never touches existing
+    // rows/queries, so old code ignores it and rollback is a no-op. Designed to never
+    // need an ALTER: type/provenance are free TEXT validated in code, and metadata is
+    // a JSON escape-hatch for any future per-edge attribute.
+    await env.DB.exec(`CREATE TABLE IF NOT EXISTS edges (id TEXT PRIMARY KEY, source_id TEXT NOT NULL, target_id TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'relates_to', weight REAL NOT NULL DEFAULT 0.5, provenance TEXT NOT NULL DEFAULT 'inferred', metadata TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(source_id, target_id, type))`);
+    await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)`);
+    await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)`);
   } catch (e) {
     console.error("Database initialization error (non-fatal):", e);
   }
@@ -304,10 +750,21 @@ export async function checkDuplicateAndContradiction(content: string, env: Env):
   duplicate: DuplicateResult;
   contradiction: ContradictionResult;
   mergeAction: MergeAction | null;
+  neighbors: { id: string; score: number }[];
 }> {
   const sample = getDuplicateCheckSample(content);
   const values = await embed(sample, env);
   const { matches } = await env.VECTORIZE.query(values, { topK: 5, returnMetadata: "all" });
+
+  // Neighbors for graph auto-linking (issue #16): the topK matches collapsed to
+  // parent ids (strongest score per parent). Exposed so captureEntry can create
+  // relates_to edges without a second embed/query.
+  const neighborScores = new Map<string, number>();
+  for (const m of matches) {
+    const pid = (m.metadata as any)?.parentId ?? m.id;
+    neighborScores.set(pid, Math.max(neighborScores.get(pid) ?? 0, m.score));
+  }
+  const neighbors = [...neighborScores.entries()].map(([id, score]) => ({ id, score }));
 
   // ── Duplicate: derived from top match ───────────────────────────────────────
   let duplicate: DuplicateResult = { status: "unique" };
@@ -429,7 +886,7 @@ Respond with JSON only. No text outside the JSON object.
     }
   }
 
-  return { duplicate, contradiction, mergeAction };
+  return { duplicate, contradiction, mergeAction, neighbors };
 }
 
 // ─── Chunking ─────────────────────────────────────────────────────────────────
@@ -461,7 +918,24 @@ interface VectorizeMatch {
   id: string;
   score: number;
   metadata?: Record<string, unknown>;
+  values?: number[] | Float32Array | Float64Array; // present when the query/getByIds returned vectors (used by MMR)
 }
+
+// Recency-decay floors: the minimum fraction of its semantic relevance a memory
+// keeps regardless of age (applied in rerankWithTimeDecay). Because decay now
+// bottoms out at a floor instead of exp()-ing toward zero, recency becomes a
+// tie-breaker rather than a gate — a strong old match can no longer be buried
+// under a fresh weak one. Durability sets the floor: settled/important memories
+// barely fade, volatile tasks still do. Staleness is handled by status +
+// contradiction, not by making old memories invisible.
+export const RECENCY_FLOOR = 0.6;            // ordinary memories keep >= 60% (a clearly-stronger old match beats a weak fresh one)
+export const RECENCY_FLOOR_DURABLE = 0.9;    // canonical or importance >= 4 barely decay
+export const RECENCY_FLOOR_VOLATILE = 0.15;  // tasks fade hard (paired with the 7-day half-life)
+
+// MMR diversity: how much the final top-K trades relevance for variety. Higher =
+// more relevance-focused, lower = more diverse. 0.7 keeps the top hit intact while
+// stopping near-duplicate (usually recent) memories from taking every slot.
+export const MMR_LAMBDA = 0.7;
 
 export function getHalfLifeMs(tags: string[]): number {
   if (tags.includes("task")) return 7 * 24 * 60 * 60 * 1000;  // 7 days
@@ -504,9 +978,19 @@ export function rerankWithTimeDecay(
       const rc = recallCounts.get(parentId) ?? 0;
 
       const halfLifeMs = getHalfLifeMs(tags);
-      const recencyMultiplier = Math.exp(-ageMs / halfLifeMs);
-      // Frequency can compensate for recency loss but never push above a fresh entry (cap at 1.0).
-      // Without the cap, high recall counts overwhelm recency and bury newly-stored memories.
+      const imp = importanceScores.get(parentId) ?? 0;
+
+      // Recency ranks but never excludes. The decay bottoms out at a durability-aware
+      // floor: canonical decisions and high-importance memories barely fade, ordinary
+      // memories keep at least RECENCY_FLOOR of their relevance, and only volatile tasks
+      // decay hard (paired with their short half-life). A strong old match therefore
+      // stays in contention instead of being annihilated by exp() toward zero.
+      const recencyFloor =
+        getStatus(tags) === "canonical" || imp >= 4 ? RECENCY_FLOOR_DURABLE
+        : tags.includes("task") ? RECENCY_FLOOR_VOLATILE
+        : RECENCY_FLOOR;
+      const recencyMultiplier = recencyFloor + (1 - recencyFloor) * Math.exp(-ageMs / halfLifeMs);
+      // Frequency lifts often-recalled memories toward a fresh entry (still capped at 1.0).
       const frequencyMultiplier = 1 + Math.log1p(rc);
       const combinedMultiplier = Math.min(1.0, recencyMultiplier * frequencyMultiplier);
       const isShortAppend = match.id.includes("-update-") &&
@@ -518,7 +1002,6 @@ export function rerankWithTimeDecay(
       // Survivors (net wins) rise toward 5; repeatedly-contradicted memories (net losses)
       // fall toward 1. log1p gives diminishing returns; clamp keeps the effect inside the
       // existing 0.88–1.20 importance band. The stored importance_score is never mutated.
-      const imp = importanceScores.get(parentId) ?? 0;
       const wins = contradictionWins.get(parentId) ?? 0;
       const losses = contradictionLosses.get(parentId) ?? 0;
       const net = wins - losses;
@@ -540,6 +1023,41 @@ export function rerankWithTimeDecay(
       return { ...match, score: match.score * combinedMultiplier * appendPenalty * rolledUpPenalty * importanceMultiplier * tagBoost };
     })
     .sort((a, b) => b.score - a.score);
+}
+
+// Maximal Marginal Relevance: greedily pick a diverse top-K instead of taking the K
+// highest-scoring candidates. Taking the top K by score alone lets near-duplicate
+// (usually recent) memories fill every slot and crowd out distinct older ones. Each
+// pick maximizes  λ·relevance − (1−λ)·maxCosineSimilarityToAlreadyPicked.
+// Relevance is min-max normalized across the pool so it's on the same 0..1 scale as
+// the cosine redundancy term (the reranked score is on the RRF scale, not cosine).
+// Candidates without a vector (keyword-only hits) take no redundancy penalty — those
+// are exact-identifier matches we want to keep. The most-relevant item always seeds
+// the set, so the top result is unchanged; only the tail is diversified.
+export function mmrRerank<T extends VectorizeMatch>(candidates: T[], lambda: number, k: number): T[] {
+  if (candidates.length <= 1 || k <= 1) return candidates.slice(0, k);
+  const pool = [...candidates].sort((a, b) => b.score - a.score);
+  const maxRel = pool[0].score || 1;
+  const rel = (m: VectorizeMatch) => (maxRel > 0 ? m.score / maxRel : 0);
+
+  const selected: T[] = [pool.shift()!];
+  while (selected.length < k && pool.length) {
+    let bestIdx = 0;
+    let bestMmr = -Infinity;
+    for (let i = 0; i < pool.length; i++) {
+      const cand = pool[i];
+      let maxSim = 0;
+      if (cand.values) {
+        for (const s of selected) {
+          if (s.values) maxSim = Math.max(maxSim, cosineSim(cand.values, s.values));
+        }
+      }
+      const mmr = lambda * rel(cand) - (1 - lambda) * maxSim;
+      if (mmr > bestMmr) { bestMmr = mmr; bestIdx = i; }
+    }
+    selected.push(pool.splice(bestIdx, 1)[0]);
+  }
+  return selected;
 }
 
 // ─── Temporal phrase parsing ──────────────────────────────────────────────────
@@ -744,7 +1262,7 @@ async function storeEntry(
       };
 
       tags.forEach(t => {
-        metadata[`tag_${t}`] = true;
+        metadata[`tag_${t.replace(/[."]/g, "_")}`] = true;
       });
 
       return {
@@ -755,7 +1273,10 @@ async function storeEntry(
     })
   );
 
-  await env.VECTORIZE.insert(vectors);
+  // upsert (not insert): on update the re-embed of a single-chunk entry reuses
+  // the entry id, and Vectorize insert() silently skips ids that already exist —
+  // so insert would leave the stale embedding in place. upsert overwrites it.
+  await env.VECTORIZE.upsert(vectors);
 
   const vectorIds = vectors.map(v => v.id);
 
@@ -772,8 +1293,23 @@ async function storeEntry(
 // id, so the re-embedded vector reuses the old id. Deleting the full old set
 // would remove the vector we just inserted, leaving the entry unsearchable.
 async function deleteStaleVectors(env: Env, oldIds: string[], newIds: string[]): Promise<void> {
+  // Guard (#212): an empty newIds means the re-embed produced nothing — it failed.
+  // Deleting every old vector would leave the entry unsearchable, so keep them instead.
+  // storeEntry always yields >= 1 vector for non-empty content, so this never fires on success.
+  if (!newIds.length) return;
   const stale = oldIds.filter(v => !newIds.includes(v));
   if (stale.length) await env.VECTORIZE.deleteByIds(stale);
+}
+
+// Re-embed BEFORE mutating the entry so a failed embed can never leave it
+// updated-but-unsearchable (#212). storeEntry writes the new vectors and updates
+// vector_ids; on throw or an empty result the caller must NOT touch D1 content or
+// delete old vectors — the entry stays intact and searchable. Callers surface the
+// failure to the user instead of reporting success.
+async function reembedOrThrow(env: Env, id: string, content: string, tags: string[], source: string): Promise<string[]> {
+  const ids = await storeEntry(env, id, content, tags, source, Date.now());
+  if (!ids.length) throw new Error("re-embed produced no vectors");
+  return ids;
 }
 
 // ─── Append to existing entry ─────────────────────────────────────────────────
@@ -807,23 +1343,27 @@ async function appendToEntry(
     // Combined content is too large for a single vector — re-chunk everything.
     // Same safe ordering as update/merge/replace: insert new → delete old.
 
-    // Step 1: Persist full combined content to D1
+    // Step 1: Re-embed FIRST (#212). If it fails this throws, and the /append handler
+    // surfaces a 500 with the entry's content and vectors left intact — instead of
+    // committing new content and then deleting every vector (silently unsearchable).
+    const newVectorIds = await reembedOrThrow(env, id, newContent, tags, source);
+
+    // Step 2: Embed succeeded → persist the full combined content to D1.
     await env.DB.prepare(`UPDATE entries SET content = ? WHERE id = ?`)
       .bind(newContent, id).run();
-
-    // Step 2: Re-chunk + re-embed full content (also updates vector_ids in D1)
-    let newVectorIds: string[] = [];
-    try {
-      newVectorIds = await storeEntry(env, id, newContent, tags, source, Date.now());
-    } catch (e) {
-      console.error("Vectorize re-embed failed (non-fatal):", e);
-    }
 
     // Step 3: Delete only stale vectors — ids reused by the re-embed must survive
     try {
       await deleteStaleVectors(env, existingVectorIds, newVectorIds);
     } catch (e) {
       console.error("Old vector cleanup failed (non-fatal):", e);
+    }
+
+    // Auto-link the updated entry to similar neighbors (#16) — same inference as on capture.
+    try {
+      await inferEdgesOnWrite(id, await neighborsFromVectorQuery(await embed(addition, env), env), env);
+    } catch (e) {
+      console.error("Append auto-link failed (non-fatal):", e);
     }
 
     return;
@@ -845,7 +1385,7 @@ async function appendToEntry(
   };
 
   tags.forEach(t => {
-    metadata[`tag_${t}`] = true;
+    metadata[`tag_${t.replace(/[."]/g, "_")}`] = true;
   });
 
   await env.VECTORIZE.insert([{
@@ -858,6 +1398,13 @@ async function appendToEntry(
   await env.DB.prepare(
     `UPDATE entries SET content = ?, vector_ids = ? WHERE id = ?`
   ).bind(newContent, JSON.stringify([...existingVectorIds, newChunkId]), id).run();
+
+  // Auto-link the updated entry to similar neighbors (#16) — reuse the addition embedding.
+  try {
+    await inferEdgesOnWrite(id, await neighborsFromVectorQuery(values, env), env);
+  } catch (e) {
+    console.error("Append auto-link failed (non-fatal):", e);
+  }
 }
 
 // ─── Synthesize insight from retrieved memories ───────────────────────────────
@@ -1084,6 +1631,62 @@ async function runNightlyCompression(env: Env, ctx: ExecutionContext): Promise<v
   }
 }
 
+// ─── Nightly graph maintenance (issue #16) ──────────────────────────────────────
+// Bounded, idempotent background pass that keeps the relationship graph healthy:
+// prunes weak stale auto-edges, then backfills links for still-unlinked entries so
+// memories created before linking existed gradually join the graph. Runs on the same
+// daily cron as compression — no new/extra trigger. (A future fast-follow can add an
+// LLM step that promotes generic relates_to edges to specific types from EDGE_TYPES.)
+const GRAPH_PASS_BACKFILL_LIMIT = 25;          // unlinked entries to link per run
+const EDGE_PRUNE_WEIGHT = 0.3;                 // inferred edges weaker than this are prune candidates…
+const EDGE_PRUNE_MIN_AGE_MS = 7 * 24 * 60 * 60 * 1000; // …once they're at least a week old
+
+export async function runGraphPass(env: Env, ctx: ExecutionContext): Promise<void> {
+  await initializeDatabase(env);
+
+  // (1) Prune weak, old, INFERRED edges only — explicit (user) and system (lifecycle)
+  // edges are never auto-removed. That's exactly what `provenance` is for.
+  try {
+    await env.DB.prepare(
+      `DELETE FROM edges WHERE provenance = 'inferred' AND weight < ? AND updated_at < ?`
+    ).bind(EDGE_PRUNE_WEIGHT, Date.now() - EDGE_PRUNE_MIN_AGE_MS).run();
+  } catch (e) {
+    console.error("Graph prune failed (non-fatal):", e);
+  }
+
+  // (2) Backfill: find a bounded batch of entries with no edges yet and link each to
+  // its nearest neighbors (same logic as on-write inference). Empty edges table →
+  // every entry is unlinked → the graph fills in over successive nightly runs.
+  let unlinked: { id: string; content: string }[] = [];
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT id, content FROM entries
+       WHERE id NOT IN (SELECT source_id FROM edges) AND id NOT IN (SELECT target_id FROM edges)
+         AND tags NOT LIKE '%"status:deprecated"%'
+       ORDER BY created_at DESC LIMIT ${GRAPH_PASS_BACKFILL_LIMIT}`
+    ).all() as { results: { id: string; content: string }[] };
+    unlinked = results;
+  } catch (e) {
+    console.error("Graph backfill query failed (non-fatal):", e);
+  }
+
+  for (const entry of unlinked) {
+    try {
+      const values = await embed(entry.content, env);
+      const { matches } = await env.VECTORIZE.query(values, { topK: 5, returnMetadata: "all" });
+      const scores = new Map<string, number>();
+      for (const m of matches) {
+        const pid = (m.metadata as any)?.parentId ?? m.id;
+        scores.set(pid, Math.max(scores.get(pid) ?? 0, m.score));
+      }
+      const neighbors = [...scores.entries()].map(([id, score]) => ({ id, score }));
+      await inferEdgesOnWrite(entry.id, neighbors, env);
+    } catch (e) {
+      console.error(`Graph backfill failed for ${entry.id} (non-fatal):`, e);
+    }
+  }
+}
+
 // ─── Shared search path ───────────────────────────────────────────────────────
 // Used by both the `recall` MCP tool and GET /recall — the full semantic
 // search pipeline (embed → vector query → time-decay rerank → dedupe → D1
@@ -1097,11 +1700,33 @@ export interface RecallMatch {
   tags: string[];
   source: string;
   isUpdate: boolean;
+  hop: number; // 0 = direct match; ≥1 = surfaced via graph expansion (issue #16)
 }
 
 export interface RecallSearchResult {
   matches: RecallMatch[];
   insight: string;
+  // True when the dense (Vectorize) step could not run — recall fell back to
+  // keyword-only. Lets callers tell the user semantic search is unavailable.
+  semanticUnavailable: boolean;
+  queryUsed?: string; // the distilled query actually embedded (transparency + debugging)
+}
+
+// Render recall matches as the MCP tool's text reply. Crucially includes each entry's
+// ID so an LLM can act on a result (link, connections, append, update, forget) without
+// a second list_recent round-trip — recall used to drop the ID, which left tools unable
+// to reference the memories they just found.
+export function renderRecallText(matches: RecallMatch[], insight: string): string {
+  const text = matches.map((m, i) => {
+    const date = new Date(m.createdAt).toLocaleDateString();
+    const tagList = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
+    const src = m.source ? ` · ${m.source}` : "";
+    const score = (m.score * 100).toFixed(0);
+    const updateLabel = m.isUpdate ? " [updated]" : "";
+    const hopLabel = m.hop > 0 ? ` [related · ${m.hop} hop${m.hop > 1 ? "s" : ""}]` : "";
+    return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${updateLabel}${hopLabel}\nID: ${m.id}\n${m.content}`;
+  }).join("\n\n");
+  return insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text;
 }
 
 // ─── Hybrid recall: keyword search + Reciprocal Rank Fusion ────────────────────
@@ -1117,6 +1742,44 @@ export function tokenizeQuery(query: string): string[] {
       .map(t => t.replace(/^[^\w#.]+|[^\w#.]+$/g, "").replace(/[%_]/g, ""))
       .filter(t => t.length >= KEYWORD_MIN_TOKEN_LEN && !KEYWORD_STOPWORDS.has(t))
   )];
+}
+
+// Reduce a query to the terms that actually discriminate in THIS brain, in one data-driven
+// pass: strip grammatical stopwords, then from a single corpus document-frequency scan drop
+// terms that saturate the corpus (framing words like "user"/"wants" and topic-common words
+// like "second brain" are both common → dropped) and keep only the rarest MAX_QUERY_TERMS.
+// This replaces the old static framing wordlist + LLM rewrite: it needs no wordlist, no AI
+// call, and adapts to each brain automatically. Word order is preserved for the embedding.
+// Falls back to the content words (then the raw query) if the scan is unavailable.
+export async function distillToRareTerms(query: string, env: Env): Promise<string> {
+  const words = query.split(/\s+/).filter(Boolean);
+  const norm = (w: string) => w.toLowerCase().replace(/^[^\w#.]+|[^\w#.]+$/g, "");
+  const content = words.filter(w => {
+    const n = norm(w);
+    return n.length >= KEYWORD_MIN_TOKEN_LEN && !KEYWORD_STOPWORDS.has(n);
+  });
+  if (content.length <= 1) return content.length ? content.join(" ") : query;
+
+  const uniq = [...new Set(content.map(norm))].slice(0, 16);
+  try {
+    const sums = uniq.map((_, i) => `SUM(CASE WHEN content LIKE ? THEN 1 ELSE 0 END) AS d${i}`).join(", ");
+    const row = await env.DB.prepare(`SELECT COUNT(*) AS total, ${sums} FROM entries`)
+      .bind(...uniq.map(t => `%${t}%`)).first() as Record<string, number> | null;
+    if (!row || !row.total) return content.join(" ");
+    const total = row.total;
+    const df = new Map(uniq.map((t, i) => [t, (row[`d${i}`] as number) ?? 0]));
+    // Drop corpus-saturating terms; if that leaves nothing, keep all and let the cap decide.
+    let candidates = uniq.filter(t => (df.get(t) ?? 0) / total <= QUERY_SATURATION_FRACTION);
+    if (!candidates.length) candidates = uniq;
+    // Keep only the rarest MAX_QUERY_TERMS so common words can't dilute the query.
+    const keep = new Set(
+      [...candidates].sort((a, b) => (df.get(a) ?? 0) - (df.get(b) ?? 0)).slice(0, MAX_QUERY_TERMS)
+    );
+    const rebuilt = [...new Set(content.filter(w => keep.has(norm(w))))];
+    return rebuilt.length ? rebuilt.join(" ") : content.join(" ");
+  } catch {
+    return content.join(" ");
+  }
 }
 
 // Keyword candidates: entries whose content contains any query token, bounded by
@@ -1162,8 +1825,16 @@ function fuseDenseAndKeyword(
   }
   const denseRanked = [...denseByParent.keys()];
 
-  const keywordRanked = keywordRows
-    .map(r => ({ row: r, weight: tokens.reduce((n, t) => n + (r.content.toLowerCase().includes(t) ? 1 : 0), 0) }))
+  // IDF over the keyword candidate pool: a token matching few candidates (distinctive,
+  // e.g. an identifier or a rare noun) is worth far more than one matching many (a common
+  // word). Without this, a verbose query's common words outvote the rare token that
+  // actually pins the intent. Frequencies are derived from the data — nothing hardcoded.
+  const kwLower = keywordRows.map(r => ({ row: r, lc: r.content.toLowerCase() }));
+  const kwN = kwLower.length || 1;
+  const kwDf = new Map(tokens.map(t => [t, kwLower.reduce((n, x) => n + (x.lc.includes(t) ? 1 : 0), 0)]));
+  const kwIdf = (t: string) => Math.log(1 + kwN / ((kwDf.get(t) ?? 0) + 1));
+  const keywordRanked = kwLower
+    .map(x => ({ row: x.row, weight: tokens.reduce((s, t) => s + (x.lc.includes(t) ? kwIdf(t) : 0), 0) }))
     .filter(x => x.weight > 0 && (allowKeywordOnly || denseByParent.has(x.row.id)))
     .sort((a, b) => b.weight - a.weight || b.row.created_at - a.row.created_at || (a.row.id < b.row.id ? -1 : 1));
 
@@ -1174,7 +1845,7 @@ function fuseDenseAndKeyword(
   for (const [pid, score] of fused) {
     const dm = denseByParent.get(pid);
     if (dm) {
-      out.push({ id: dm.id, score, metadata: dm.metadata });
+      out.push({ id: dm.id, score, metadata: dm.metadata, values: dm.values });
     } else {
       const r = keywordRowById.get(pid)!;
       out.push({ id: pid, score, metadata: { parentId: pid, created_at: r.created_at, tags: JSON.parse(r.tags ?? "[]"), content: r.content, source: r.source } });
@@ -1184,13 +1855,16 @@ function fuseDenseAndKeyword(
 }
 
 export async function recallEntries(
-  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind },
+  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind; hops?: number; synthesize?: boolean },
   env: Env,
   ctx: ExecutionContext
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
+  const synthesize = params.synthesize ?? true;
   let { tag, after, before, kind } = params;
+  const hops = Math.max(0, Math.min(GRAPH_MAX_HOPS, params.hops ?? 0));
   const now = Date.now();
+  let semanticUnavailable = false;
 
   let embedQuery = query;
   if (after === undefined && before === undefined) {
@@ -1199,6 +1873,9 @@ export async function recallEntries(
     before = parsed.before;
     embedQuery = parsed.cleanQuery;
   }
+  // Reduce the query to the terms that actually discriminate in this brain (data-driven:
+  // strips framing + corpus-common words, keeps the rarest few) so it embeds on its subject.
+  embedQuery = await distillToRareTerms(embedQuery, env);
 
   const tokens = tokenizeQuery(embedQuery);
   const [values, queryTags] = await Promise.all([
@@ -1216,17 +1893,22 @@ export async function recallEntries(
     const { results: tagRows } = await env.DB.prepare(
       `SELECT id, vector_ids, content, tags, source, created_at FROM entries WHERE tags LIKE ?`
     ).bind(`%"${tag}"%`).all();
-    if (!tagRows.length) return { matches: [], insight: "" };
+    if (!tagRows.length) return { matches: [], insight: "", semanticUnavailable };
     keywordRows = tagRows as unknown as KeywordRow[];
 
     const vectorIds = [...new Set(
       (tagRows as any[]).flatMap(r => JSON.parse((r.vector_ids as string) ?? "[]") as string[])
     )];
-    if (!vectorIds.length) return { matches: [], insight: "" };
+    if (!vectorIds.length) return { matches: [], insight: "", semanticUnavailable };
 
     const vectors: VectorizeVector[] = [];
-    for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
-      vectors.push(...await env.VECTORIZE.getByIds(vectorIds.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH)));
+    try {
+      for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
+        vectors.push(...await env.VECTORIZE.getByIds(vectorIds.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH)));
+      }
+    } catch (e) {
+      console.error("Vectorize getByIds failed (degrading to keyword-only):", e);
+      semanticUnavailable = true;
     }
 
     results = {
@@ -1234,32 +1916,45 @@ export async function recallEntries(
         id: v.id,
         score: cosineSim(values, v.values as number[]),
         metadata: v.metadata,
+        values: v.values as number[],
       })) as VectorizeMatch[],
     };
   } else {
     // Cloudflare Vectorize caps topK at 50 when returnMetadata="all" (error 40025).
     // Run the keyword search in parallel with the dense query.
     const vectorizeTopK = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
-    const [denseResults, kwRows] = await Promise.all([
-      env.VECTORIZE.query(values, { topK: vectorizeTopK, returnMetadata: "all" }),
-      keywordSearch(tokens, env),
-    ]);
+    const denseQuery = async (): Promise<{ matches: VectorizeMatch[] }> => {
+      try {
+        return await env.VECTORIZE.query(values, { topK: vectorizeTopK, returnMetadata: "all", returnValues: true });
+      } catch (e) {
+        // This is the authoritative signal that the Vectorize index is unreachable —
+        // semanticUnavailable drives the dashboard banner (checkVectorizeHealth/GET /health
+        // is the full health probe; this catch fires only when the query itself throws).
+        console.error("Vectorize query failed (degrading to keyword-only):", e);
+        semanticUnavailable = true;
+        return { matches: [] as VectorizeMatch[] };
+      }
+    };
+    const [denseResults, kwRows] = await Promise.all([denseQuery(), keywordSearch(tokens, env)]);
     results = denseResults;
     keywordRows = kwRows;
 
-    if (results.matches.length && results.matches[0].score < DUPLICATE_FLAG_THRESHOLD) {
-      results = await env.VECTORIZE.query(values, {
-        topK: 50,
-        returnMetadata: "all",
-      });
+    if (!semanticUnavailable && results.matches.length && results.matches[0].score < DUPLICATE_FLAG_THRESHOLD) {
+      try {
+        results = await env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all", returnValues: true });
+      } catch (e) {
+        // Narrow query already succeeded with real matches, so the index works.
+        // A transient widen failure must not claim semantic search is unavailable.
+        console.error("Vectorize widen-query failed (non-fatal, keeping narrow results):", e);
+      }
     }
   }
 
   // Always-on hybrid retrieval: fuse dense + keyword candidates via RRF. On the tag path
   // keyword is a re-ranking signal only (allowKeywordOnly=false); on the default path it can
   // also surface exact-identifier matches the dense top-K missed entirely.
-  const fusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag);
-  if (!fusedMatches.length) return { matches: [], insight: "" };
+  const fusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag || semanticUnavailable);
+  if (!fusedMatches.length) return { matches: [], insight: "", semanticUnavailable };
 
   // Fetch recall_count and importance_score for all candidates to use in scoring.
   // The tag path can produce far more than 100 candidates, so chunk the IN query
@@ -1282,20 +1977,42 @@ export async function recallEntries(
   const reranked = rerankWithTimeDecay(fusedMatches, recallCounts, importanceScores, queryTags, contradictionWins, contradictionLosses);
 
   const seen = new Set<string>();
-  const deduped = reranked.filter((m) => {
+  const dedupedAll = reranked.filter((m) => {
     const parentId = (m.metadata as any)?.parentId ?? m.id;
     if (seen.has(parentId)) return false;
     seen.add(parentId);
     return true;
-  }).slice(0, topK);
+  });
+  // Diversity: MMR-select the top-K so near-duplicate (usually recent) memories can't
+  // take every slot and bury distinct older ones. The top hit is preserved; the tail
+  // is diversified. Reduces to top-K-by-score when there's nothing to diversify.
+  const deduped = mmrRerank(dedupedAll, MMR_LAMBDA, topK);
 
-  if (!deduped.length) return { matches: [], insight: "" };
+  if (!deduped.length) return { matches: [], insight: "", semanticUnavailable };
 
-  // Fetch full content from D1 for all matched parent IDs, applying filters: auto-pattern
+  const seedParentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
+
+  // Multi-hop expansion (issue #16): walk the graph outward from the direct-match seeds
+  // and fold in related memories. Each expanded node is scored as a fraction of the
+  // WEAKEST seed (minSeedScore × decay^hop × edgeWeight), so a related node can never
+  // outrank a direct match — recall never regresses — while neighbors still order by
+  // graph distance and link strength. hops:0 → no expansion → byte-for-byte today's path.
+  let expandedScored: { parentId: string; score: number; hop: number }[] = [];
+  if (hops > 0) {
+    const minSeedScore = deduped.reduce((mn, m) => Math.min(mn, m.score), Infinity);
+    const expanded = await expandGraph(seedParentIds, { hops }, env);
+    expandedScored = expanded.map(n => ({
+      parentId: n.id,
+      hop: n.hop,
+      score: minSeedScore * Math.pow(GRAPH_HOP_DECAY, n.hop) * n.viaWeight,
+    }));
+  }
+
+  // Fetch full content from D1 for seeds + expanded nodes, applying filters: auto-pattern
   // exclusion, status:deprecated exclusion, optional kind match, and optional after/before range
-  const parentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
-  const placeholders = parentIds.map(() => "?").join(", ");
-  const d1Bindings: (string | number)[] = [...parentIds];
+  const allParentIds = [...seedParentIds, ...expandedScored.map(e => e.parentId)];
+  const placeholders = allParentIds.map(() => "?").join(", ");
+  const d1Bindings: (string | number)[] = [...allParentIds];
   let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"status:deprecated"%'`;
   if (kind && (KIND_VALUES as readonly string[]).includes(kind)) {
     // Safe to interpolate: `kind` is validated against the KIND_VALUES enum just above,
@@ -1309,26 +2026,25 @@ export async function recallEntries(
 
   const d1Map = new Map(d1Rows.map((r) => [r.id as string, r]));
 
-  // Increment recall_count for entries actually shown
+  // Increment recall_count for the DIRECT seeds shown — never for graph-expanded
+  // neighbors, or well-connected nodes would inflate their own ranking (feedback loop).
+  const seedIdSet = new Set(seedParentIds);
   ctx.waitUntil(
     Promise.all(
-      [...d1Map.keys()].map(id =>
+      [...d1Map.keys()].filter(id => seedIdSet.has(id)).map(id =>
         env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`).bind(id).run()
       )
     ).catch(e => console.error("recall_count update failed (non-fatal):", e))
   );
 
-  const matches: RecallMatch[] = deduped.flatMap((m) => {
+  const seedMatches: RecallMatch[] = deduped.flatMap((m) => {
     const meta = m.metadata as Record<string, any>;
     const parentId = (meta?.parentId ?? m.id) as string;
     const row = d1Map.get(parentId);
-    const isUpdate = !!meta?.isUpdate;
-
     if (!row) {
       // D1 row not found — either filtered out (e.g. status:deprecated) or genuinely missing
       return [];
     }
-
     return [{
       id: parentId,
       content: row.content as string,
@@ -1336,17 +2052,43 @@ export async function recallEntries(
       createdAt: row.created_at as number,
       tags: JSON.parse(row.tags ?? "[]"),
       source: row.source as string,
-      isUpdate,
+      isUpdate: !!meta?.isUpdate,
+      hop: 0,
     }];
   });
+
+  const expandedMatches: RecallMatch[] = expandedScored.flatMap((e) => {
+    const row = d1Map.get(e.parentId);
+    if (!row) return []; // filtered out (deprecated/kind/range) or missing
+    return [{
+      id: e.parentId,
+      content: row.content as string,
+      score: e.score,
+      createdAt: row.created_at as number,
+      tags: JSON.parse(row.tags ?? "[]"),
+      source: row.source as string,
+      isUpdate: false,
+      hop: e.hop,
+    }];
+  });
+
+  // Seeds always outrank expanded by construction, so they fill the top and expanded
+  // occupy only leftover slots — a direct match is never displaced by a neighbor.
+  const matches: RecallMatch[] = [...seedMatches, ...expandedMatches]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
 
   // Normalize fused scores to 0–1 (top match = 1.0) so the displayed match % is a clean,
   // monotonically-decreasing scale rather than raw RRF values.
   const maxScore = matches.reduce((mx, m) => Math.max(mx, m.score), 0);
   if (maxScore > 0) for (const m of matches) m.score = m.score / maxScore;
 
-  const insight = d1Rows.length > 1
-    ? await synthesizeInsight(embedQuery, d1Rows as { id: string; content: string }[], env)
+  // Synthesize over exactly what's shown (seeds + any surfaced neighbors) so the
+  // insight stays grounded in the returned results. Skipped when the caller opts
+  // out (synthesize=false): MCP clients re-synthesize the returned memories with
+  // their own model, so a server-side insight there is a redundant LLM call.
+  const insight = synthesize && matches.length > 1
+    ? await synthesizeInsight(embedQuery, matches.map(m => ({ id: m.id, content: m.content })), env)
     : "";
 
   if (d1Rows.length >= 5) {
@@ -1356,7 +2098,7 @@ export async function recallEntries(
     );
   }
 
-  return { matches, insight };
+  return { matches, insight, semanticUnavailable, queryUsed: embedQuery };
 }
 
 // ─── Shared write path ────────────────────────────────────────────────────────
@@ -1401,7 +2143,7 @@ export async function captureEntry(
   const c = cleanContent || raw;
   const t = [...new Set([...tags.map(tag => tag.toLowerCase()), ...hashtags])];
 
-  const { duplicate: dup, contradiction, mergeAction } = await checkDuplicateAndContradiction(c, env);
+  const { duplicate: dup, contradiction, mergeAction, neighbors } = await checkDuplicateAndContradiction(c, env);
 
   if (dup.status === "blocked") {
     return { status: "blocked", matchId: dup.matchId, score: dup.score };
@@ -1428,26 +2170,32 @@ export async function captureEntry(
         return { status: "flagged", id: crypto.randomUUID(), matchId: targetId, score: dup.score };
       }
 
-      // Step 1: Update D1 content
-      await env.DB.prepare(`UPDATE entries SET content = ? WHERE id = ?`).bind(newContent, targetId).run();
-
-      // Step 2: Re-embed new content — inserts new vectors, updates vector_ids in D1
-      let newVectorIds: string[] = [];
+      // Re-embed FIRST (#212): if it fails, leave the merge target completely
+      // untouched and fall through to a normal insert (keep_both, recoverable) —
+      // instead of overwriting its content and then deleting its vectors, which
+      // would silently destroy the target's searchability.
+      let newVectorIds: string[] | null = null;
       try {
-        newVectorIds = await storeEntry(env, targetId, newContent, existingTags, existingSource, Date.now());
-      } catch (e) { console.error("Vectorize re-embed failed (non-fatal):", e); }
+        newVectorIds = await reembedOrThrow(env, targetId, newContent, existingTags, existingSource);
+      } catch (e) {
+        console.error("Merge re-embed failed — keeping both, target untouched:", e);
+      }
 
-      // Step 3: Delete only stale vectors — ids reused by the re-embed must survive
-      try {
-        await deleteStaleVectors(env, oldVectorIds, newVectorIds);
-      } catch (e) { console.error("Old vector cleanup failed (non-fatal):", e); }
+      if (newVectorIds) {
+        // Embed succeeded → commit the merge onto the target.
+        await env.DB.prepare(`UPDATE entries SET content = ? WHERE id = ?`).bind(newContent, targetId).run();
+        try {
+          await deleteStaleVectors(env, oldVectorIds, newVectorIds);
+        } catch (e) { console.error("Old vector cleanup failed (non-fatal):", e); }
 
-      // Re-classify the merged/replaced content — updates importance_score + kind (and canonical if warranted) on the target.
-      scheduleClassifyAndTag(targetId, newContent, env, ctx);
+        // Re-classify the merged/replaced content — updates importance_score + kind (and canonical if warranted) on the target.
+        scheduleClassifyAndTag(targetId, newContent, env, ctx);
 
-      return mergeAction.action === "merge"
-        ? { status: "merged", id: targetId }
-        : { status: "replaced", id: targetId };
+        return mergeAction.action === "merge"
+          ? { status: "merged", id: targetId }
+          : { status: "replaced", id: targetId };
+      }
+      // Re-embed failed → fall through to the normal insert below (keep_both).
     }
     // target not found in DB — fall through to normal insert
   }
@@ -1506,8 +2254,21 @@ export async function captureEntry(
     } catch (e) {
       console.error("Contradiction deprecation failed (non-fatal):", e);
     }
+    // Project the lifecycle into the graph: the new entry supersedes the deprecated
+    // one (#16). Skip a redundant relates_to to the superseded node — the supersedes
+    // edge already captures that relationship — but still auto-link other neighbors.
+    try {
+      await createEdge(id, conflictId, "supersedes", { provenance: "system", weight: 1.0 }, env);
+    } catch (e) {
+      console.error("Supersedes edge creation failed (non-fatal):", e);
+    }
+    ctx.waitUntil(inferEdgesOnWrite(id, neighbors.filter(n => n.id !== conflictId), env).catch(e => console.error("Edge inference failed (non-fatal):", e)));
     return { status: "contradiction", id, resolvedConflict: conflictId, reason: contradiction.reason };
   }
+
+  // Reached here without contradiction handling (flagged-new-row or stored) — both
+  // are genuinely new nodes, so auto-link to similar neighbors (#16).
+  ctx.waitUntil(inferEdgesOnWrite(id, neighbors, env).catch(e => console.error("Edge inference failed (non-fatal):", e)));
 
   if (dup.status === "flagged") {
     return { status: "flagged", id, matchId: dup.matchId, score: dup.score };
@@ -1534,6 +2295,15 @@ export async function forgetEntry(id: string, env: Env): Promise<ForgetResult> {
   const vectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
 
   await env.DB.prepare(`DELETE FROM entries WHERE id = ?`).bind(id).run();
+
+  // Cascade: drop any edges touching this node (as source or target) so the graph
+  // never holds links pointing at a deleted entry. Non-fatal — a failed cleanup
+  // must not abort the delete.
+  try {
+    await env.DB.prepare(`DELETE FROM edges WHERE source_id = ? OR target_id = ?`).bind(id, id).run();
+  } catch (e) {
+    console.error("Edge cascade-delete failed (non-fatal):", e);
+  }
 
   try {
     if (vectorIds.length) {
@@ -1580,9 +2350,97 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
   return true;
 }
 
+// ─── Integration mirror store ─────────────────────────────────────────────────
+// The narrow write surface integration syncs use to mirror external items into
+// the memory store (see src/integrations/framework.ts). Mirrors bypass
+// captureEntry's duplicate/contradiction pipeline on purpose: the external tool
+// is the source of truth for its own items, dedupe is by item id (the KV
+// itemMap), and every sync replaces content wholesale.
+
+function makeMirrorStore(env: Env): MirrorStore {
+  return {
+    async createEntry(content, tags, source) {
+      const id = crypto.randomUUID();
+      const now = Date.now();
+      await env.DB.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids) VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(id, content, JSON.stringify(tags), source, now, "[]").run();
+      // Embed failure is non-fatal — the entry keeps vector_ids=[] and the
+      // vectorize-pending backstop re-embeds it later.
+      try {
+        await storeEntry(env, id, content, tags, source, now);
+      } catch (e) {
+        console.error("Vectorize insert failed (non-fatal):", e);
+      }
+      return id;
+    },
+    async updateEntry(id, content) {
+      const row = await env.DB.prepare(
+        `SELECT tags, source, vector_ids FROM entries WHERE id = ?`
+      ).bind(id).first() as Record<string, any> | null;
+      if (!row) return false;
+
+      const tags: string[] = JSON.parse(row.tags ?? "[]");
+      const oldVectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
+
+      // Same safe ordering as update/merge/replace: insert new → delete old.
+      await env.DB.prepare(`UPDATE entries SET content = ? WHERE id = ?`).bind(content, id).run();
+      let newVectorIds: string[] = [];
+      try {
+        newVectorIds = await storeEntry(env, id, content, tags, row.source as string, Date.now());
+      } catch (e) {
+        console.error("Vectorize re-embed failed (non-fatal):", e);
+      }
+      try {
+        await deleteStaleVectors(env, oldVectorIds, newVectorIds);
+      } catch (e) {
+        console.error("Old vector cleanup failed (non-fatal):", e);
+      }
+      return true;
+    },
+    async deleteEntry(id) {
+      await forgetEntry(id, env);
+    },
+  };
+}
+
+// Mirrored entries are replaced wholesale on every sync, so a manual
+// append/update would be silently clobbered by the item's next upstream edit.
+// While the integration is connected, redirect edits to the source tool. After
+// disconnect, mirrors become ordinary editable memories. Provider ids double
+// as entry `source` values, so the registry is the lookup.
+async function isManagedMirror(source: string, env: Env): Promise<boolean> {
+  return getProvider(source) !== null && (await loadIntegration(env, source)) !== null;
+}
+
+function mirrorEditError(source: string): string {
+  const name = getProvider(source)?.name ?? source;
+  return `This memory is synced from ${name}. Edit it in ${name} (the change syncs automatically), or disconnect the ${name} integration to make it editable.`;
+}
+
+// Nightly sync: loop bounded batches per provider so a backlog converges
+// across runs without betting the invocation's subrequest budget on one pass.
+const CRON_SYNC_MAX_BATCHES = 5;
+
+async function runScheduledIntegrationSync(env: Env): Promise<void> {
+  let initialized = false;
+  for (const provider of Object.values(INTEGRATION_PROVIDERS)) {
+    if (!(await loadIntegration(env, provider.id))) continue;
+    if (!initialized) {
+      await initializeDatabase(env);
+      initialized = true;
+    }
+    const store = makeMirrorStore(env);
+    for (let i = 0; i < CRON_SYNC_MAX_BATCHES; i++) {
+      const result = await provider.sync(env, store);
+      if (!result.ok || result.remaining === 0) break;
+    }
+  }
+}
+
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
-function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
+export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
   const server = new McpServer({ name: "second-brain", version: "1.0.0" });
 
   // ── remember ────────────────────────────────────────────────────────────
@@ -1652,6 +2510,10 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         };
       }
 
+      if (await isManagedMirror(source, env)) {
+        return { content: [{ type: "text", text: mirrorEditError(source) }] };
+      }
+
       try {
         await appendToEntry(env, id, existingContent, a, tags, source);
       } catch (e) {
@@ -1693,6 +2555,10 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
 
       if (!row) {
         return { content: [{ type: "text", text: `No entry found with ID: ${id}` }] };
+      }
+
+      if (await isManagedMirror(row.source as string, env)) {
+        return { content: [{ type: "text", text: mirrorEditError(row.source as string) }] };
       }
 
       const tags: string[] = JSON.parse(row.tags ?? "[]").filter((t: string) => t !== "rolled-up");
@@ -1754,26 +2620,21 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         after: z.number().int().optional().describe("Only return entries after this Unix ms timestamp"),
         before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp"),
         kind: z.enum([...KIND_VALUES] as [string, ...string[]]).optional().describe("Filter to episodic (events) or semantic (facts/knowledge)"),
+        hops: z.number().int().min(0).max(3).default(0).describe("Graph expansion depth: 0 = direct matches only (default); 1–2 also surfaces related memories linked in the graph"),
       },
     },
-    async ({ query, topK, tag, after, before, kind }) => {
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined }, env, ctx);
+    async ({ query, topK, tag, after, before, kind, hops }) => {
+      const { matches, insight, semanticUnavailable } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops, synthesize: false }, env, ctx);
+
+      const notice = semanticUnavailable
+        ? `Note: semantic search is unavailable because the Vectorize index is missing, so these are keyword matches only. Fix: ${VECTORIZE_FIX_HINT}.\n\n`
+        : "";
 
       if (!matches.length) {
-        return { content: [{ type: "text", text: "Nothing found matching that query." }] };
+        return { content: [{ type: "text", text: notice + "Nothing found matching that query." }] };
       }
 
-      const text = matches.map((m, i) => {
-        const date = new Date(m.createdAt).toLocaleDateString();
-        const tagList = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
-        const src = m.source ? ` · ${m.source}` : "";
-        const score = (m.score * 100).toFixed(0);
-        const updateLabel = m.isUpdate ? " [updated]" : "";
-        return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${updateLabel}\n${m.content}`;
-      }).join("\n\n");
-
-      const finalText = insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text;
-      return { content: [{ type: "text", text: finalText }] };
+      return { content: [{ type: "text", text: notice + renderRecallText(matches, insight) }] };
     }
   );
 
@@ -1826,7 +2687,150 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
     }
   );
 
+  // ── link ─────────────────────────────────────────────────────────────────
+  server.registerTool(
+    "link",
+    {
+      description: "Create an explicit relationship link between two memories by ID (e.g. connect a decision to its outcome). Get the IDs from recall or list_recent first.",
+      inputSchema: {
+        source_id: z.string().describe("Source entry ID"),
+        target_id: z.string().describe("Target entry ID"),
+        type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).default("relates_to").describe("Relationship type"),
+      },
+    },
+    async ({ source_id, target_id, type }) => {
+      const edge = await createEdge(source_id, target_id, type, { provenance: "explicit", weight: 1.0 }, env);
+      if (!edge) return { content: [{ type: "text", text: "Cannot link an entry to itself." }] };
+      return { content: [{ type: "text", text: `Linked ${edge.source_id} → ${edge.target_id} (${edgeLabel(edge.type)}).` }] };
+    }
+  );
+
+  // ── unlink ───────────────────────────────────────────────────────────────
+  server.registerTool(
+    "unlink",
+    {
+      description: "Remove a relationship link between two memories by ID. Use when a link is incorrect or no longer relevant. Get the IDs from recall or connections first.",
+      inputSchema: {
+        source_id: z.string().describe("Source entry ID"),
+        target_id: z.string().describe("Target entry ID"),
+        type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).optional().describe("Only remove this relationship type; omit to remove all links between the pair"),
+      },
+    },
+    async ({ source_id, target_id, type }) => {
+      const deleted = await deleteEdge(source_id, target_id, type, env);
+      if (!deleted) return { content: [{ type: "text", text: "No link found between those entries." }] };
+      return { content: [{ type: "text", text: `Removed ${deleted} link(s) between ${source_id} and ${target_id}.` }] };
+    }
+  );
+
+  // ── connections ──────────────────────────────────────────────────────────
+  server.registerTool(
+    "connections",
+    {
+      description: "List the memories directly linked to a given entry (its 1-hop neighbors in the relationship graph). Get the entry ID from recall or list_recent first.",
+      inputSchema: {
+        id: z.string().describe("Entry ID from recall or list_recent"),
+        type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).optional().describe("Filter to a single relationship type"),
+      },
+    },
+    async ({ id, type }) => {
+      const connections = await getConnections(id, type, env);
+      if (!connections.length) {
+        return { content: [{ type: "text", text: `No connections found for ${id}.` }] };
+      }
+      const text = connections
+        .map(c => `- (${c.label}) ${c.id}: ${c.content.slice(0, 120)}`)
+        .join("\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
   return server;
+}
+
+// ─── MCP tools/list sanitization ──────────────────────────────────────────────
+// Newer @modelcontextprotocol/sdk releases attach an `execution` (task-support)
+// field to each tool definition in tools/list responses. Strict MCP clients —
+// OpenAI Codex at the time of writing — reject the entire tool list when they
+// see the unknown field, which breaks the connection outright. Strip it so any
+// client can connect; the server doesn't use MCP task execution, so nothing is
+// lost. Remove this shim if we ever adopt task execution or once strict clients
+// tolerate unknown fields.
+//
+// Bug discovered, and fix originally authored, in the
+// guoyingwei6/second-brain-cloudflare fork (commit a3fa15f).
+
+export async function isMcpToolsListRequest(request: Request): Promise<boolean> {
+  if (request.method !== "POST") return false;
+  try {
+    const payload = await request.clone().json();
+    return isRecord(payload) && payload.method === "tools/list";
+  } catch {
+    return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function removeToolExecutionMetadata(payload: unknown): unknown {
+  if (!isRecord(payload) || !isRecord(payload.result) || !Array.isArray(payload.result.tools)) {
+    return payload;
+  }
+
+  const tools = payload.result.tools.map(tool => {
+    if (!isRecord(tool) || !("execution" in tool)) return tool;
+    const { execution: _execution, ...toolWithoutExecution } = tool;
+    return toolWithoutExecution;
+  });
+
+  return {
+    ...payload,
+    result: {
+      ...payload.result,
+      tools,
+    },
+  };
+}
+
+export async function sanitizeToolsListResponse(response: Response): Promise<Response> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json") && !contentType.includes("text/event-stream")) {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+
+  if (contentType.includes("text/event-stream")) {
+    const body = await response.text();
+    const sanitized = body.split("\n").map(line => {
+      if (!line.startsWith("data: ")) return line;
+      try {
+        return `data: ${JSON.stringify(removeToolExecutionMetadata(JSON.parse(line.slice(6))))}`;
+      } catch {
+        return line;
+      }
+    }).join("\n");
+
+    return new Response(sanitized, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
+  try {
+    const payload = await response.json();
+    return new Response(JSON.stringify(removeToolExecutionMetadata(payload)), {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  } catch {
+    return response;
+  }
 }
 
 // ─── OAuth API handler — /mcp only ────────────────────────────────────────────
@@ -1839,7 +2843,9 @@ const apiHandler = {
       ctx.waitUntil(initializeDatabase(env).then(() => { dbReady = true; }));
     }
     const server = buildMcpServer(env, ctx);
-    return createMcpHandler(server)(request, env, ctx);
+    const isToolsList = await isMcpToolsListRequest(request);
+    const response = await createMcpHandler(server)(request, env, ctx);
+    return isToolsList ? sanitizeToolsListResponse(response) : response;
   },
 };
 
@@ -1960,6 +2966,10 @@ const defaultHandler = {
       const tags: string[] = JSON.parse(row.tags ?? "[]");
       const source = row.source as string;
 
+      if (await isManagedMirror(source, env)) {
+        return json({ ok: false, error: mirrorEditError(source) }, 409);
+      }
+
       try {
         await appendToEntry(env, id, existingContent, addition, tags, source);
       } catch (e) {
@@ -1992,6 +3002,10 @@ const defaultHandler = {
 
       if (!row) return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
 
+      if (await isManagedMirror(row.source as string, env)) {
+        return json({ ok: false, error: mirrorEditError(row.source as string) }, 409);
+      }
+
       const tags: string[] = JSON.parse(row.tags ?? "[]");
       const { cleanContent, hashtags: newHashtags } = extractHashtags(newContent);
       const mergedTags = [...new Set([...tags, ...newHashtags])];
@@ -1999,16 +3013,20 @@ const defaultHandler = {
       const oldVectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
       const finalContent = cleanContent || newContent;
 
+      // Re-embed FIRST (#212): if it fails, leave the entry's content and vectors
+      // untouched and surface an error, instead of committing new content and then
+      // deleting every vector — which would leave the entry silently unsearchable.
+      let newVectorIds: string[];
+      try {
+        newVectorIds = await reembedOrThrow(env, id, finalContent, mergedTags, source);
+      } catch (e) {
+        console.error("Re-embed failed — entry left unchanged:", e);
+        return json({ ok: false, error: "Couldn't update: search re-index failed. Your memory is unchanged — please try again." }, 500);
+      }
+
+      // Embed succeeded → safe to commit the new content and retire stale vectors.
       await env.DB.prepare(`UPDATE entries SET content = ?, tags = ? WHERE id = ?`)
         .bind(finalContent, JSON.stringify(mergedTags), id).run();
-
-      let newVectorIds: string[] = [];
-      try {
-        newVectorIds = await storeEntry(env, id, finalContent, mergedTags, source, Date.now());
-      } catch (e) {
-        console.error("Vectorize re-embed failed (non-fatal):", e);
-      }
-      const newVectorCount = newVectorIds.length;
 
       try {
         await deleteStaleVectors(env, oldVectorIds, newVectorIds);
@@ -2016,7 +3034,7 @@ const defaultHandler = {
         console.error("Old vector cleanup failed (non-fatal):", e);
       }
 
-      return json({ ok: true, id, vectors: newVectorCount });
+      return json({ ok: true, id, vectors: newVectorIds.length });
     }
 
     // GET /count
@@ -2045,7 +3063,8 @@ const defaultHandler = {
       const [summary, tagRows, candidateRows] = await Promise.all([
         env.DB.prepare(
           `SELECT COUNT(*) as count, AVG(importance_score) as avg_importance,
-           SUM(CASE WHEN vector_ids = '[]' AND created_at < ? THEN 1 ELSE 0 END) as unvectorized
+           SUM(CASE WHEN vector_ids = '[]' AND created_at < ? THEN 1 ELSE 0 END) as unvectorized,
+           SUM(CASE WHEN tags NOT LIKE '%"status:%' AND tags NOT LIKE '%"kind:%' THEN 1 ELSE 0 END) as unclassified
            FROM entries`
         ).bind(graceCutoff).first() as Promise<Record<string, any> | null>,
         env.DB.prepare(`SELECT value, COUNT(*) as n FROM entries, json_each(entries.tags) GROUP BY value ORDER BY n DESC LIMIT 5`).all(),
@@ -2082,7 +3101,17 @@ const defaultHandler = {
         digest_candidates: digestCandidates,
         unvectorized: (summary?.unvectorized as number) ?? 0,
         vectorize_grace_ms: graceMs(env),
+        unclassified: (summary?.unclassified as number) ?? 0,
       });
+    }
+
+    // GET /health — index/runtime health, used by the dashboard banner, the
+    // README verify step, and external uptime checks.
+    if (url.pathname === "/health" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      const vectorize = await checkVectorizeHealth(env);
+      return json({ ok: vectorize.ok, version: SB_VERSION, vectorize });
     }
 
     // GET /list
@@ -2099,6 +3128,45 @@ const defaultHandler = {
       return json(results);
     }
 
+    // GET /export — complete backup: every entry plus the edges table. Single
+    // unbounded SELECTs are acceptable here: D1 handles tens of thousands of rows in
+    // one read and this route runs on explicit user action only. If response size
+    // ever becomes a problem, add ?after= cursor support then, not now.
+    if (url.pathname === "/export" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const { results: entryRows } = await env.DB.prepare(
+        `SELECT id, content, tags, source, created_at, recall_count, importance_score, contradiction_wins, contradiction_losses FROM entries ORDER BY created_at DESC`
+      ).all() as { results: Record<string, any>[] };
+      const { results: edgeRows } = await env.DB.prepare(
+        `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges`
+      ).all() as { results: Record<string, any>[] };
+
+      // vector_ids are deliberately excluded — they're deployment-specific and an
+      // import tool re-embeds anyway. Tags are parsed so the file holds real arrays.
+      const entries = entryRows.map(r => ({
+        id: r.id,
+        content: r.content,
+        tags: JSON.parse(r.tags ?? "[]"),
+        source: r.source,
+        created_at: r.created_at,
+        recall_count: r.recall_count ?? 0,
+        importance_score: r.importance_score ?? 0,
+        contradiction_wins: r.contradiction_wins ?? 0,
+        contradiction_losses: r.contradiction_losses ?? 0,
+      }));
+      const edges = edgeRows.map(r => ({
+        source_id: r.source_id,
+        target_id: r.target_id,
+        type: r.type,
+        weight: r.weight,
+        provenance: r.provenance,
+        created_at: r.created_at,
+      }));
+      return json({ ok: true, exported_at: Date.now(), version: 2, entries, edges });
+    }
+
     // GET /recall — semantic search, mirrors the MCP `recall` tool
     if (url.pathname === "/recall" && request.method === "GET") {
       const authErr = requireAuth(request, env);
@@ -2113,15 +3181,25 @@ const defaultHandler = {
       const before = url.searchParams.has("before") ? parseInt(url.searchParams.get("before")!, 10) : undefined;
       const kindParam = url.searchParams.get("kind")?.trim();
       const kind = kindParam && (KIND_VALUES as readonly string[]).includes(kindParam) ? kindParam as MemoryKind : undefined;
+      const hops = Math.min(Math.max(parseInt(url.searchParams.get("hops") ?? "0", 10), 0), 3);
 
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind }, env, ctx);
+      const { matches, insight, semanticUnavailable, queryUsed } = await recallEntries({ query, topK, tag, after, before, kind, hops }, env, ctx);
 
       if (!matches.length) {
-        return json({ ok: true, results: [], message: "Nothing found matching that query." });
+        return json({
+          ok: true,
+          results: [],
+          query_used: queryUsed,
+          semantic_unavailable: semanticUnavailable,
+          message: semanticUnavailable
+            ? `Semantic search unavailable (Vectorize index missing). Fix: ${VECTORIZE_FIX_HINT}.`
+            : "Nothing found matching that query.",
+        });
       }
 
       return json({
         ok: true,
+        query_used: queryUsed,
         results: matches.map(m => ({
           id: m.id,
           content: m.content,
@@ -2130,8 +3208,10 @@ const defaultHandler = {
           source: m.source,
           created_at: m.createdAt,
           updated: m.isUpdate,
+          hop: m.hop,
         })),
         insight: insight || null,
+        semantic_unavailable: semanticUnavailable,
       });
     }
 
@@ -2152,6 +3232,101 @@ const defaultHandler = {
       }
 
       return json({ ok: true, id, deletedVectors: result.vectorCount });
+    }
+
+    // POST /link — create an explicit edge between two memories, mirrors the MCP `link` tool
+    if (url.pathname === "/link" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      let body: { source_id?: string; target_id?: string; type?: string };
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const sourceId = body.source_id?.trim();
+      const targetId = body.target_id?.trim();
+      if (!sourceId || !targetId) return json({ ok: false, error: "source_id and target_id are required" }, 400);
+      const type = body.type?.trim() || "relates_to";
+      if (!isValidEdgeType(type)) {
+        return json({ ok: false, error: `type must be one of: ${Object.keys(EDGE_TYPES).join(", ")}` }, 400);
+      }
+
+      const edge = await createEdge(sourceId, targetId, type, { provenance: "explicit", weight: 1.0 }, env);
+      if (!edge) return json({ ok: false, error: "Cannot link an entry to itself" }, 400);
+      return json({ ok: true, source_id: edge.source_id, target_id: edge.target_id, type: edge.type });
+    }
+
+    // POST /unlink — remove a relationship link, mirrors the MCP `unlink` tool.
+    // POST rather than DELETE /link: CORS_HEADERS allow only GET/POST/OPTIONS and
+    // every sibling mutation route is POST.
+    if (url.pathname === "/unlink" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      let body: { source_id?: string; target_id?: string; type?: string };
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const sourceId = body.source_id?.trim();
+      const targetId = body.target_id?.trim();
+      if (!sourceId || !targetId) return json({ ok: false, error: "source_id and target_id are required" }, 400);
+      const type = body.type?.trim() || undefined;
+      if (type && !isValidEdgeType(type)) {
+        return json({ ok: false, error: `type must be one of: ${Object.keys(EDGE_TYPES).join(", ")}` }, 400);
+      }
+
+      const deleted = await deleteEdge(sourceId, targetId, type, env);
+      return json({ ok: true, deleted });
+    }
+
+    // GET /connections — 1-hop neighbors of an entry, mirrors the MCP `connections` tool
+    if (url.pathname === "/connections" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const id = url.searchParams.get("id")?.trim();
+      if (!id) return json({ ok: false, error: "id is required" }, 400);
+      const type = url.searchParams.get("type")?.trim() || undefined;
+
+      const connections = await getConnections(id, type, env);
+      return json({ ok: true, id, connections });
+    }
+
+    // GET /entry — one full row by id, for the dashboard graph view's tap-to-open
+    // (/graph ships 80-char labels only; fattening it with full content would bloat
+    // every graph load to serve a per-tap need). Dashboard-only, no MCP twin.
+    if (url.pathname === "/entry" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const id = url.searchParams.get("id")?.trim();
+      if (!id) return json({ ok: false, error: "id is required" }, 400);
+
+      const row = await env.DB.prepare(
+        `SELECT id, content, tags, source, created_at FROM entries WHERE id = ?`
+      ).bind(id).first() as Record<string, any> | null;
+      if (!row) return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
+
+      return json({
+        ok: true,
+        entry: {
+          id: row.id,
+          content: row.content,
+          tags: JSON.parse(row.tags ?? "[]"),
+          source: row.source,
+          created_at: row.created_at,
+        },
+      });
+    }
+
+    // GET /graph — node+edge subgraph for the dashboard graph view (dashboard-only;
+    // no MCP twin — this is visualization data, not an agent capability)
+    if (url.pathname === "/graph" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const seed = url.searchParams.get("seed")?.trim() || undefined;
+      const limitParam = url.searchParams.get("limit");
+      const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+
+      const { nodes, edges } = await buildGraph({ seed, limit }, env);
+      return json({ ok: true, nodes, edges });
     }
 
     // POST /status — set lifecycle status, mirrors the MCP `set_status` tool
@@ -2175,6 +3350,43 @@ const defaultHandler = {
       }
 
       return json({ ok: true, id, status });
+    }
+
+    // POST /patterns/resolve — confirm or dismiss an auto-derived pattern.
+    // Dashboard-only, no MCP twin: pattern review is a human curation act, not an
+    // agent capability. Confirm promotes the pattern into a real recallable memory;
+    // dismiss deprecates it (audit row kept, vectors removed).
+    if (url.pathname === "/patterns/resolve" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      let body: { id?: string; action?: string };
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const id = body.id?.trim();
+      if (!id) return json({ ok: false, error: "id is required" }, 400);
+      const action = body.action;
+      if (action !== "confirm" && action !== "dismiss") {
+        return json({ ok: false, error: `action must be "confirm" or "dismiss"` }, 400);
+      }
+
+      const row = await env.DB.prepare(`SELECT id, tags FROM entries WHERE id = ?`).bind(id).first() as Record<string, any> | null;
+      if (!row) return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
+      const tags: string[] = JSON.parse(row.tags ?? "[]");
+      if (!tags.includes("auto-pattern")) {
+        return json({ ok: false, error: "Entry is not an auto-derived pattern" }, 400);
+      }
+
+      if (action === "confirm") {
+        // Losing the auto-pattern tag is what exits the recall exclusion — it's
+        // enforced at D1 hydration, not vector metadata, so this tag update alone
+        // makes the entry recallable. No re-embed: content is unchanged and vectors
+        // already exist (the stale auto-pattern flag in vector metadata is harmless).
+        const promoted = withStatus(withKind(tags.filter(t => t !== "auto-pattern"), "semantic"), "canonical");
+        await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`).bind(JSON.stringify(promoted), id).run();
+      } else {
+        await deprecateEntry(id, env);
+      }
+      return json({ ok: true, id, action });
     }
 
     // POST /chat
@@ -2260,6 +3472,143 @@ const defaultHandler = {
       return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
     }
 
+    // ─── Integrations (settings UI) ─────────────────────────────────────────
+    // External sources mirrored into memory, driven entirely by the provider
+    // registry — adding a provider requires no route changes. State (token,
+    // account, item map) lives in OAUTH_KV under integrations:* — no schema
+    // change, and the namespace already exists in every deployment. See
+    // src/integrations/.
+
+    // GET /integrations — provider list + connection status (never the token)
+    if (url.pathname === "/integrations" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      const integrations = [];
+      for (const provider of Object.values(INTEGRATION_PROVIDERS)) {
+        integrations.push(integrationStatus(provider, await loadIntegration(env, provider.id)));
+      }
+      return json({ ok: true, integrations });
+    }
+
+    // POST /integrations/:provider/(connect|sync|disconnect)
+    const integrationRoute = url.pathname.match(/^\/integrations\/([a-z0-9-]+)\/(connect|sync|disconnect)$/);
+    if (integrationRoute && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      const provider = getProvider(integrationRoute[1]);
+      if (!provider) return json({ ok: false, error: `Unknown integration: ${integrationRoute[1]}` }, 404);
+      const action = integrationRoute[2];
+
+      // connect — validate the pasted token against the provider's API
+      // (server-side; the browser can't for CORS reasons) and store it only if
+      // it works.
+      if (action === "connect") {
+        let body: { token?: string };
+        try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+        const token = body.token?.trim();
+        if (!token) return json({ ok: false, error: "token is required" }, 400);
+
+        let workspaceName: string;
+        try {
+          workspaceName = await provider.validateToken(token);
+        } catch (e) {
+          return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 400);
+        }
+
+        // Preserve the item map across reconnects so already-mirrored items
+        // update in place instead of duplicating.
+        const existing = await loadIntegration(env, provider.id);
+        const now = Date.now();
+        const record: IntegrationRecord = {
+          provider: provider.id,
+          authKind: "token",
+          credentials: { token },
+          config: existing?.config ?? {},
+          status: "connected",
+          workspaceName,
+          lastSyncedAt: existing?.lastSyncedAt ?? null,
+          lastSyncError: null,
+          itemMap: existing?.itemMap ?? {},
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+        };
+        await saveIntegration(env, record);
+        return json({ ok: true, provider: provider.id, workspaceName });
+      }
+
+      // sync — one bounded batch; callers loop while `remaining` > 0 (same
+      // pattern as POST /vectorize-pending).
+      if (action === "sync") {
+        if (!(await loadIntegration(env, provider.id))) {
+          return json({ ok: false, error: `${provider.name} is not connected` }, 404);
+        }
+        const result = await provider.sync(env, makeMirrorStore(env));
+        return json(result, result.ok ? 200 : 502);
+      }
+
+      // disconnect — remove the connection. Mirrored memories are kept
+      // (they're the user's data) unless purge=true.
+      let body: { purge?: boolean } = {};
+      try { body = await request.json(); } catch { /* empty body — keep memories */ }
+      const record = await loadIntegration(env, provider.id);
+      if (!record) return json({ ok: false, error: `${provider.name} is not connected` }, 404);
+
+      let purged = 0;
+      if (body.purge) {
+        for (const mapped of Object.values(record.itemMap)) {
+          try {
+            const r = await forgetEntry(mapped.entryId, env);
+            if (r.status === "deleted") purged++;
+          } catch (e) {
+            console.error("Mirror purge failed (non-fatal):", e);
+          }
+        }
+      }
+      await deleteIntegration(env, provider.id);
+      return json({ ok: true, purged, kept: body.purge ? 0 : Object.keys(record.itemMap).length });
+    }
+
+    // POST /classify-pending
+    // One-time, opt-in backfill: runs classifyEntry over entries that predate the
+    // status (#119) and kind (#12) features and writes status:/kind: tags. Bounded
+    // batch per call, idempotent (skips entries that already carry either tag), and
+    // resumable (safe to stop/restart). No schema migration — only writes tags.
+    if (url.pathname === "/classify-pending" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const UNCLASSIFIED_WHERE = `tags NOT LIKE '%"status:%' AND tags NOT LIKE '%"kind:%'`;
+
+      const { results: toProcess } = await env.DB.prepare(
+        `SELECT id, content, tags FROM entries
+         WHERE ${UNCLASSIFIED_WHERE}
+         ORDER BY created_at ASC LIMIT 25`
+      ).all();
+
+      let processed = 0;
+      let failed = 0;
+
+      for (const row of toProcess as Record<string, any>[]) {
+        try {
+          const { canonical, kind } = await classifyEntry(row.content as string, env);
+          let tags: string[] = JSON.parse(row.tags as string);
+          if (kind) tags = withKind(tags, kind);
+          if (canonical && getStatus(tags) === null) tags = withStatus(tags, "canonical");
+          await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`).bind(JSON.stringify(tags), row.id).run();
+          processed++;
+        } catch (e) {
+          console.error("Classification backfill failed for entry", row.id, e);
+          failed++;
+        }
+      }
+
+      const remaining = await env.DB.prepare(
+        `SELECT COUNT(*) as count FROM entries WHERE ${UNCLASSIFIED_WHERE}`
+      ).first() as Record<string, any> | null;
+
+      return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
+    }
+
     return new Response("Not found", { status: 404 });
   },
 };
@@ -2290,5 +3639,7 @@ export default {
     oauthProvider.fetch(req, env as any, ctx),
   scheduled: async (_event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
     ctx.waitUntil(runNightlyCompression(env, ctx));
+    ctx.waitUntil(runGraphPass(env, ctx));
+    ctx.waitUntil(runScheduledIntegrationSync(env));
   },
 };

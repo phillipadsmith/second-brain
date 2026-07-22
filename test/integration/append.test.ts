@@ -29,6 +29,37 @@ describe("POST /append", () => {
     expect(res.status).toBe(400);
   });
 
+  it("auto-links the entry to a similar neighbor after appending (#16)", async () => {
+    db.entries.push({ id: "target", content: "Original note", tags: "[]", source: "api", created_at: 1, vector_ids: "[]" });
+    db.entries.push({ id: "neighbor", content: "Related memory", tags: "[]", source: "api", created_at: 1, vector_ids: "[]" });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [{ id: "neighbor", score: 0.85, metadata: { parentId: "neighbor" } }] }),
+      }),
+    });
+
+    const res = await worker.fetch(req("POST", "/append", { body: { id: "target", addition: "New related detail" } }), env, ctx);
+    expect(res.status).toBe(200);
+
+    const e = db.edges.find((x: any) => x.type === "relates_to");
+    expect(e).toBeTruthy();
+    expect([e.source_id, e.target_id].sort()).toEqual(["neighbor", "target"]);
+    expect(e.provenance).toBe("inferred");
+  });
+
+  it("does not link a loosely-related neighbor below the threshold", async () => {
+    db.entries.push({ id: "target", content: "Original note", tags: "[]", source: "api", created_at: 1, vector_ids: "[]" });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [{ id: "loose", score: 0.6, metadata: { parentId: "loose" } }] }),
+      }),
+    });
+
+    const res = await worker.fetch(req("POST", "/append", { body: { id: "target", addition: "New detail" } }), env, ctx);
+    expect(res.status).toBe(200);
+    expect(db.edges).toHaveLength(0);
+  });
+
   it("returns 404 for non-existent id", async () => {
     const res = await worker.fetch(req("POST", "/append", { body: { id: "no-such-id", addition: "update" } }), env, ctx);
     expect(res.status).toBe(404);
@@ -127,11 +158,11 @@ describe("POST /append", () => {
     expect(deleteByIdsMock).toHaveBeenCalledWith(["entry-1", "entry-1-update-111"]);
   });
 
-  it("oversized append: new vectors inserted before old ones are deleted (safe ordering)", async () => {
+  it("oversized append: new vectors written before old ones are deleted (safe ordering)", async () => {
     const callOrder: string[] = [];
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
-        insert: vi.fn().mockImplementation(async () => { callOrder.push("insert"); return { mutationId: "m" }; }),
+        upsert: vi.fn().mockImplementation(async () => { callOrder.push("upsert"); return { mutationId: "m" }; }),
         deleteByIds: vi.fn().mockImplementation(async () => { callOrder.push("delete"); return { mutationId: "m" }; }),
       }),
     });
@@ -150,13 +181,18 @@ describe("POST /append", () => {
       ctx
     );
 
-    expect(callOrder.indexOf("insert")).toBeLessThan(callOrder.indexOf("delete"));
+    expect(callOrder.indexOf("upsert")).toBeLessThan(callOrder.indexOf("delete"));
   });
 
-  it("oversized append: Vectorize re-embed failure is non-fatal — D1 still updated", async () => {
+  it("oversized append: re-embed failure fails loud, D1 unchanged, old vectors kept (regression #212)", async () => {
+    // The oversized-append re-embed must run before D1 is mutated. On failure the
+    // handler returns an error and leaves content + vectors intact — never commits
+    // the new content and then deletes every vector.
+    const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "m" });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
-        insert: vi.fn().mockRejectedValue(new Error("Vectorize down")),
+        upsert: vi.fn().mockRejectedValue(new Error("Vectorize down")),
+        deleteByIds: deleteByIdsMock,
       }),
     });
     db.entries.push({
@@ -174,11 +210,11 @@ describe("POST /append", () => {
       ctx
     );
 
-    expect(res.status).toBe(200);
-    const data = await res.json() as any;
-    expect(data.ok).toBe(true);
-    // D1 content still updated even if Vectorize failed
-    expect(db.entries[0].content).toContain("More info");
+    expect(res.status).toBe(500);
+    // D1 content unchanged — the append did not commit.
+    expect(db.entries[0].content).toBe(LONG_CONTENT);
+    // Old vectors never deleted.
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
   });
 
   it("oversized append: old vector deletion failure is non-fatal", async () => {

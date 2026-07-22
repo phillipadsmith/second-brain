@@ -1,4 +1,6 @@
-# Second Brain
+<p align="center">
+  <a href="https://www.thesecondbrain.dev"><img src="https://www.thesecondbrain.dev/logos/sb-lockup.svg" alt="Second Brain" width="400"></a>
+</p>
 
 **One shared memory for Claude, ChatGPT, Cursor, Codex, and every other AI tool you use.**
 
@@ -12,13 +14,23 @@ Second Brain gives every AI tool access to the same persistent memory.
 
 Unlike memory built into a single app, this memory belongs to you. It runs in your own Cloudflare account, stays under your control, and cannot be locked inside one AI platform.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/rahilp/second-brain-cloudflare)
+**The easiest way to get started is the desktop app.** It sets everything up for you in about two minutes — no terminal, no accounts to wire together, no technical steps.
 
-Deploying takes about two minutes. See the [Quick Start](#quick-start) for the required configuration values.
+### [⬇ Download for Mac or Windows](../../releases/latest)
+
+Prefer to run it yourself? Use the one-click **[Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/rahilp/second-brain-cloudflare)** button, or follow the manual steps. See the [Quick Start](#quick-start) for all three options.
 
 > ## #3 Product of the Day on Product Hunt
 >
 > <a href="https://www.producthunt.com/products/second-brain-cloudflare?embed=true&utm_source=badge-top-post-badge&utm_medium=badge&utm_campaign=badge-second-brain-for-ai" target="_blank" rel="noopener noreferrer"><img alt="Second Brain for AI: Persistent memory for Claude, ChatGPT, and Cursor" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1151393&theme=light&period=daily&t=1780357463637"></a>
+
+## What's new in v2
+
+* **Memory graph.** Memories now connect to each other — automatically as you save, or explicitly with the new `link` and `connections` tools. Recall can follow those connections (the `hops` option) to surface related context that a plain search would miss, and the dashboard has a new **Graph** tab to explore your memory visually.
+
+* **Notion sync.** Connect your Notion workspace from **Settings → Integrations** in the dashboard. Pages you share with the connection sync into memory, stay updated as they change in Notion, and surface in recall alongside everything else. Nightly automatic sync, or on demand with **Sync now**.
+
+* **Graceful degradation.** If the Vectorize index is missing, recall now falls back to keyword search with a clear notice instead of failing, a new `/health` endpoint reports index status, and the dashboard shows a banner with the exact fix.
 
 ## See it in action
 
@@ -57,6 +69,8 @@ Memory is most useful when capturing information is easy. Second Brain connects 
   npm install -g second-brain-cf-cli
   ```
 
+* **Notion:** Connect your Notion workspace from **Settings → Integrations** in the web dashboard. Create an internal **connection** in the [Notion developer portal](https://app.notion.com/developers/connections) (a connection, not a personal access token — only connections appear in a page's Connections menu), share the pages you want remembered with it, and paste its secret — shared pages sync into memory automatically (nightly, or on demand with **Sync now**) and stay updated as they change in Notion.
+
 * **Obsidian:** Automatically sync notes using the [Second Brain Sync plugin](https://github.com/rahilp/second-brain-obsidian-plugin), also available through [Obsidian Community Plugins](https://community.obsidian.md/plugins/second-brain-sync).
 
 * **Browser extension:** Capture a page or highlighted text using the [Chrome extension](https://github.com/rahilp/second-brain-browser-extension).
@@ -67,7 +81,21 @@ Memory is most useful when capturing information is easy. Second Brain connects 
 
 ## Quick Start
 
-Set up your Second Brain in three steps.
+Pick the option that fits you. They all deploy the same Second Brain into your own Cloudflare account — the difference is only how much setup you do by hand.
+
+## Option 1 — Desktop app (recommended, no technical steps)
+
+The lowest-friction way to get started. **[Download the Second Brain desktop app](../../releases/latest)** for Mac or Windows, open it, and it walks you through setup in about two minutes: you pick a password, sign in to (or create) a free Cloudflare account, and it builds your Second Brain in your own private space and connects your AI tools for you. After setup it becomes the app you open your dashboard with every day.
+
+It also sets up the rest of the ecosystem from one place: one click to configure the [CLI](https://github.com/rahilp/second-brain-cli), and guided setup for the [browser extension](https://github.com/rahilp/second-brain-browser-extension), the [Obsidian plugin](https://community.obsidian.md/plugins/second-brain-sync), and Notion. The menu bar keeps every connection and integration a click away.
+
+Nothing to install beyond the app itself — no terminal, no git, no configuration values to copy. Developers: see [`installer/`](installer/) for how it works and how to build it.
+
+> The Mac build is signed and notarized by Apple. The Windows build is not yet code-signed, so Windows may show a SmartScreen "unrecognized app" notice on first launch — click **More info → Run anyway**. (Code signing for Windows is in progress.)
+
+## Option 2 — One-click Cloudflare deploy
+
+Prefer to deploy the Worker yourself without the app? Set it up in three steps.
 
 ### 1. Choose an authentication token
 
@@ -88,13 +116,15 @@ Save this token somewhere secure. You will need it when authorizing clients and 
 
 Click **[Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/rahilp/second-brain-cloudflare)** and follow the prompts.
 
-Enter the following value during setup:
+Enter the following values during setup:
 
 | FIELD      | VALUE                           |
 | ---------- | ------------------------------- |
+| Dimensions | `384`                           |
+| Metric     | `cosine`                        |
 | AUTH_TOKEN | The token you created in step 1 |
 
-Cloudflare will provision the required resources and deploy your Worker automatically. The Vectorize index is created for you during deployment with the correct settings (384 dimensions, cosine metric), so there is nothing else to fill in.
+Cloudflare will provision the required resources and deploy your Worker automatically.
 
 When deployment finishes, copy your Worker URL. It will look similar to:
 
@@ -204,19 +234,17 @@ OAuth requires the `OAUTH_KV` namespace for client registrations and tokens. The
 
 </details>
 
-<details>
-<summary><strong>Manual deployment</strong></summary>
+## Option 3 — Manual deployment
 
-To deploy without the one-click button:
+For developers who want full control from the command line. Requires Node.js and a Cloudflare account.
 
 ```bash
 npm install
+npm run vectors:create
 npm run deploy
 ```
 
-Wrangler will provision the required Cloudflare resources and update the remaining values in `wrangler.jsonc`.
-
-</details>
+`npm run vectors:create` creates the Vectorize index (384 dimensions, cosine). Wrangler then provisions the remaining Cloudflare resources automatically and fills in the required values in `wrangler.jsonc`. Then connect your AI clients using the same steps as Option 2, step 3.
 
 ## Documentation
 
@@ -243,6 +271,24 @@ Second Brain is built with:
 It runs within Cloudflare's free tier at personal scale.
 
 Your data stays in your own Cloudflare account.
+
+## Code signing policy
+
+Windows builds of the [Second Brain desktop app](installer/) are code-signed.
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+**Team and roles:**
+
+| Role | Members |
+| --- | --- |
+| Authors | [Rahil P (@rahilp)](https://github.com/rahilp) |
+| Reviewers | [Rahil P (@rahilp)](https://github.com/rahilp) |
+| Approvers | [Rahil P (@rahilp)](https://github.com/rahilp) |
+
+All release binaries are built from this repository's source by GitHub Actions ([installer-release.yml](.github/workflows/installer-release.yml)). Every signing request is reviewed and manually approved by an approver before a signed release is published.
+
+**Privacy statement:** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. Second Brain is self-hosted by design: during setup the desktop app talks to Cloudflare only to create resources inside *your own* Cloudflare account, and afterwards it communicates exclusively with your own private Second Brain. Your memories and credentials are never sent to the project maintainers or any other third party.
 
 ## Star History
 

@@ -7,4 +7,4 @@ docs/
 .claude/
 .dev.vars
 .env
-wrangler.deploy.jsonc
+worker-configuration.d.ts
